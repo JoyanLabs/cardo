@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="cardo">
+  <!-- Eje con dos goznes: el polo celeste apoyado en un cardo doble. -->
+  <g stroke="currentColor" fill="none" stroke-linecap="square">
+    <line x1="128" y1="56"  x2="128" y2="200" stroke-width="10"/>
+    <line x1="92"  y1="56"  x2="164" y2="56"  stroke-width="10"/>
+    <line x1="100" y1="200" x2="156" y2="200" stroke-width="10"/>
+  </g>
+  <circle cx="128" cy="34" r="18" fill="currentColor"/>
+</svg>
