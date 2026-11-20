@@ -291,9 +291,10 @@ func (r *Registry) Names() []string {
 	return ns
 }
 
-// LoadDir loads every engine .conf in dir (skipping dotfiles and editor
-// backups) and fails on duplicate NAME across files. An empty directory is a
-// valid, empty registry.
+// LoadDir loads every engine .conf in dir, skipping dotfiles, editor
+// backups and non-.conf files (documentation may live alongside engines),
+// and fails on duplicate NAME across files. An empty directory is a valid,
+// empty registry.
 func LoadDir(dir string) (*Registry, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -302,7 +303,7 @@ func LoadDir(dir string) (*Registry, error) {
 	reg := &Registry{Engines: map[string]*Engine{}}
 	for _, ent := range entries {
 		name := ent.Name()
-		if ent.IsDir() || strings.HasPrefix(name, ".") || strings.HasSuffix(name, "~") {
+		if ent.IsDir() || strings.HasPrefix(name, ".") || strings.HasSuffix(name, "~") || !strings.HasSuffix(name, ".conf") {
 			continue
 		}
 		e, err := ParseFile(filepath.Join(dir, name))

@@ -20,7 +20,7 @@ cardo down                 # stop the active engine, draining first
 cardo watch                # what occupies the slot right now
 ```
 
-Engines are declared in small config files, one per engine, so adding one is a file and not code.
+Engines are declared in small config files, one per engine, so adding one is a file and not code. The default directory is `~/.config/cardo/engines.d/` (override with `--conf-dir`); see the ADRs under `docs/adr/` for the key reference.
 
 ## Status
 

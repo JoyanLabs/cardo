@@ -157,6 +157,7 @@ func TestLoadDirNamespacesAndIgnores(t *testing.T) {
 	write(t, dir, "a.conf", "NAME=a\nTYPE=command\nSTART=/bin/a\nHEALTH=http://a\n")
 	write(t, dir, ".hidden.conf", "NAME=h\n")
 	write(t, dir, "edit.conf~", "NAME=b\n")
+	write(t, dir, "README.md", "# docs may live alongside engine confs\n")
 	if _, err := LoadDir(dir); err != nil {
 		t.Fatal(err)
 	}
