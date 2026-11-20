@@ -78,7 +78,7 @@ func (p *Probe) Count(ctx context.Context) (int, error) {
 // progress; an error means the probe itself failed. Message-only changes
 // never count as progress (ADR-0005), so only numbers are returned.
 func (p *Probe) ProgressValue(ctx context.Context) (*float64, error) {
-	body, err := p.fetchBody(ctx)
+	body, err := p.fetch(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -109,8 +109,11 @@ func (p *Probe) Check(ctx context.Context) Result {
 	return Result{Count: n, State: Busy}
 }
 
-// fetchBody GETs the probe URL with a bounded body.
-func (p *Probe) fetchBody(ctx context.Context) ([]byte, error) {
+// fetch GETs the probe URL with a bounded body. Any HTTP answer (even
+// non-200) is returned: during a model load, endpoints commonly serve
+// progress in a 503 body, and a 503 without the selector still classifies
+// as Unknown, never as Free.
+func (p *Probe) fetch(ctx context.Context) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.URL, nil)
 	if err != nil {
 		return nil, err
@@ -120,9 +123,6 @@ func (p *Probe) fetchBody(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("probe %s: HTTP %d", p.URL, resp.StatusCode)
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, err
@@ -136,7 +136,7 @@ func (p *Probe) fetchBody(ctx context.Context) ([]byte, error) {
 // fetchNumber resolves the selector to a number; anything else (missing
 // field, string, object) is an Unknown error.
 func (p *Probe) fetchNumber(ctx context.Context) (int, error) {
-	body, err := p.fetchBody(ctx)
+	body, err := p.fetch(ctx)
 	if err != nil {
 		return 0, err
 	}
