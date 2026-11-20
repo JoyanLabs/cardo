@@ -152,6 +152,115 @@ func TestValidateNumbersAndURLs(t *testing.T) {
 	}
 }
 
+// TestParseUnquotedValueKeepsEmbeddedHash pins ADR-0006's optional quoting:
+// an unquoted BUSY/PROGRESS value must survive its url#selector separator.
+// Only a '#' that starts a comment (preceded by whitespace) is a comment.
+func TestParseUnquotedValueKeepsEmbeddedHash(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "a.conf", `
+NAME=plain
+TYPE=command
+START=/bin/serve --port 8080
+HEALTH=http://127.0.0.1:8080/health
+BUSY=http://127.0.0.1:8080/metrics#$.queue.pending.length   # live jobs
+PROGRESS=http://127.0.0.1:8080/loading#progress # one word comment
+`)
+	e, err := ParseFile(p)
+	if err != nil {
+		t.Fatalf("unquoted url#selector must parse: %v", err)
+	}
+	if e.Busy == nil {
+		t.Fatal("Busy is nil: the '#' separator was eaten as a comment")
+	}
+	if e.Busy.URL != "http://127.0.0.1:8080/metrics" {
+		t.Errorf("Busy.URL = %q", e.Busy.URL)
+	}
+	if got := e.Busy.Selector.String(); got != "$.queue.pending.length" {
+		t.Errorf("Busy.Selector = %q", got)
+	}
+	if e.Progress == nil {
+		t.Fatal("Progress is nil: the '#' separator was eaten as a comment")
+	}
+	if e.Progress.URL != "http://127.0.0.1:8080/loading" {
+		t.Errorf("Progress.URL = %q", e.Progress.URL)
+	}
+	if got := e.Progress.Selector.String(); got != "$.progress" {
+		t.Errorf("Progress.Selector = %q", got)
+	}
+	// The real comment still has to go.
+	if e.Start != "/bin/serve --port 8080" {
+		t.Errorf("Start = %q", e.Start)
+	}
+}
+
+// TestParseTrailingCommentStillStripped: the other side of the rule — a
+// whitespace-preceded '#' is still a comment, and a value with no '#' at all
+// is untouched.
+func TestParseTrailingCommentStillStripped(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "a.conf", "NAME=a\nTYPE=command\nSTART=x\nHEALTH=http://x\nDESCRIPTION=plain value\t\t# tab-prefixed comment\n")
+	e, err := ParseFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Description != "plain value" {
+		t.Errorf("Description = %q, want the comment stripped", e.Description)
+	}
+}
+
+// TestValidateNumberRanges pins the ADR-0006 range rules that a successful
+// number conversion does not cover: DRAIN may be 0 (probe once and refuse),
+// WAIT must leave a positive stall window, SLOT is a non-negative index.
+func TestValidateNumberRanges(t *testing.T) {
+	base := "NAME=a\nTYPE=command\nSTART=/bin/x\nHEALTH=http://x\n"
+	cases := []struct {
+		name    string
+		line    string
+		wantKey string
+	}{
+		{"drain negative", "DRAIN=-1\n", "DRAIN"},
+		{"wait zero", "WAIT=0\n", "WAIT"},
+		{"wait negative", "WAIT=-5\n", "WAIT"},
+		{"slot negative", "SLOT=-1\n", "SLOT"},
+		{"drain zero allowed", "DRAIN=0\n", ""},
+		{"slot zero allowed", "SLOT=0\n", ""},
+		{"wait positive allowed", "WAIT=1\n", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e, err := Parse(strings.NewReader(base+c.line), "a.conf")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			err = e.Validate()
+			if c.wantKey == "" {
+				if err != nil {
+					t.Errorf("%s must be accepted, got %v", c.line, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantKey) {
+				t.Fatalf("want a %s range error, got %v", c.wantKey, err)
+			}
+			var keyErr *KeyError
+			if !errors.As(err, &keyErr) {
+				t.Errorf("range findings must be *KeyError, got %T: %v", err, err)
+			}
+		})
+	}
+}
+
+// TestLoadDirRejectsOutOfRangeNumbers: the range rules apply to real files,
+// not only to Validate called directly.
+func TestLoadDirRejectsOutOfRangeNumbers(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "a.conf", "NAME=a\nTYPE=command\nSTART=/bin/a\nHEALTH=http://a\nWAIT=0\n")
+	_, err := LoadDir(dir)
+	if err == nil || !strings.Contains(err.Error(), "WAIT") {
+		t.Fatalf("WAIT=0 must be rejected on load, got %v", err)
+	}
+}
+
 func TestLoadDirNamespacesAndIgnores(t *testing.T) {
 	dir := t.TempDir()
 	write(t, dir, "a.conf", "NAME=a\nTYPE=command\nSTART=/bin/a\nHEALTH=http://a\n")

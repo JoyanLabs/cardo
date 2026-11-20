@@ -48,6 +48,9 @@ func Parse(value string) (*Probe, error) {
 type Result struct {
 	Count int
 	State State
+	// Err carries the cause when State is Unknown, so failure reports can
+	// name the last probe error (ADR-0005 actionable failures).
+	Err error
 }
 
 // State is the typed probe outcome.
@@ -101,7 +104,7 @@ func (p *Probe) ProgressValue(ctx context.Context) (*float64, error) {
 func (p *Probe) Check(ctx context.Context) Result {
 	n, err := p.Count(ctx)
 	if err != nil {
-		return Result{State: Unknown}
+		return Result{State: Unknown, Err: err}
 	}
 	if n == 0 {
 		return Result{Count: 0, State: Free}

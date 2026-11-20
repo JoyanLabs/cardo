@@ -1,8 +1,8 @@
 // Package health waits for an engine to become healthy with a *stall*
 // timeout (ADR-0005): WAIT bounds how long health may make no observable
 // progress, not the total wait. The deadline resets when numeric loading
-// progress changes; a message alone never counts (a growing ETA can change
-// while a load is stuck).
+// progress changes or when the health answer itself changes; a message
+// alone never counts (a growing ETA can change while a load is stuck).
 package health
 
 import (
@@ -30,8 +30,8 @@ var ErrStalled = errors.New("health stalled: no progress within the WAIT window"
 // exited, or the wait was cancelled.
 var ErrBroken = errors.New("engine broken")
 
-// pollEvery bounds the probe cadence; it is clamped against the stall
-// window so a short WAIT still polls fast enough to notice progress.
+// maxPoll bounds the probe cadence; it is clamped against the stall window
+// so a short WAIT still polls fast enough to notice progress.
 const maxPoll = 1 * time.Second
 
 // pollInterval returns the probe cadence for a stall window.
@@ -47,23 +47,16 @@ func pollInterval(stall time.Duration) time.Duration {
 }
 
 // Wait polls the health URL until it answers 2xx, extending the stall
-// deadline on observable progress. progressURL is the optional PROGRESS
-// endpoint (ADR-0005); alive reports whether the engine process/container is
-// still alive. alive being false at any point is ErrBroken.
-func Wait(ctx context.Context, healthURL, progressURL string, alive func() bool, stall time.Duration) error {
-	var progress *probe.Probe
-	if progressURL != "" {
-		p, err := probe.Parse(progressURL + "#$.progress")
-		if err != nil {
-			return fmt.Errorf("%w: bad PROGRESS: %v", ErrBroken, err)
-		}
-		progress = p
-	}
-
+// deadline on observable progress. progress is the optional PROGRESS probe
+// (ADR-0005, passed parsed so the selector cannot be mangled); alive reports
+// whether the engine process/container is still alive. alive being false at
+// any point is ErrBroken.
+func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() bool, stall time.Duration) error {
 	deadline := time.Now().Add(stall)
 	cadence := pollInterval(stall)
 	portSeen := false
 	var lastProgress *float64
+	lastCode := -1 // no answer yet
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for {
@@ -89,12 +82,18 @@ func Wait(ctx context.Context, healthURL, progressURL string, alive func() bool,
 		}
 
 		code, body, err := fetch(ctx, client, healthURL)
-		switch {
-		case err == nil && code == http.StatusOK:
-			return nil
-		case err == nil:
-			// Endpoint answered: if the numeric progress changed, the load is
-			// moving; reset the deadline (llama-swap rule).
+		if err == nil {
+			if code/100 == 2 {
+				return nil
+			}
+			// The endpoint answered: any *change* in the answer (a status it
+			// had not served before) is one progress event. An identical
+			// status served forever with no numeric progress is a stall —
+			// a growing ETA must never extend the deadline.
+			if code != lastCode {
+				deadline = time.Now().Add(stall)
+				lastCode = code
+			}
 			if p, ok := numericProgress(body); ok {
 				if lastProgress == nil || *p != *lastProgress {
 					lastProgress = p
@@ -107,7 +106,7 @@ func Wait(ctx context.Context, healthURL, progressURL string, alive func() bool,
 		// engines whose HEALTH never exposes it.
 		if progress != nil {
 			ctxP, cancel := context.WithTimeout(ctx, 3*time.Second)
-			if pv, err := progress.ProgressValue(ctxP); err == nil && pv != nil {
+			if pv, perr := progress.ProgressValue(ctxP); perr == nil && pv != nil {
 				if lastProgress == nil || *pv != *lastProgress {
 					lastProgress = pv
 					deadline = time.Now().Add(stall)
@@ -144,7 +143,8 @@ func fetch(ctx context.Context, client *http.Client, url string) (int, []byte, e
 
 // numericProgress extracts a numeric progress field from a JSON body. A
 // body without a usable number (llama-server's 503 error object, string
-// progress) is not a progress report.
+// progress) is not a progress report. The top-level "progress" key is a
+// documented compatibility surface with llama-swap's loading reports.
 func numericProgress(body []byte) (*float64, bool) {
 	var doc map[string]any
 	if err := json.Unmarshal(body, &doc); err != nil {

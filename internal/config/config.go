@@ -220,6 +220,7 @@ func (e *Engine) Validate() error {
 		return &KeyError{File: e.File, Key: key, Reason: reason}
 	}
 	errs = append(errs, e.validateNums(kerr)...)
+	errs = append(errs, e.validateRanges(kerr)...)
 	switch e.Type {
 	case TypeDocker:
 		if e.Container == "" {
@@ -266,6 +267,24 @@ func (e *Engine) validateNums(kerr func(string, string) error) []error {
 	var out []error
 	for _, ne := range e.numErrs {
 		out = append(out, kerr(ne[0], "not a number: "+ne[1]))
+	}
+	return out
+}
+
+// validateRanges applies the value ranges a successful conversion does not
+// cover. DRAIN may be 0 (ask BUSY once and refuse to swap while busy) but
+// never negative; WAIT bounds the stall window so it must leave a positive
+// budget; SLOT is a non-negative GPU index.
+func (e *Engine) validateRanges(kerr func(string, string) error) []error {
+	var out []error
+	if e.Drain < 0 {
+		out = append(out, kerr("DRAIN", "must be >= 0 (0 asks BUSY once and refuses to swap while busy)"))
+	}
+	if e.Wait <= 0 {
+		out = append(out, kerr("WAIT", "must be > 0 (the stall timeout in seconds)"))
+	}
+	if e.Slot < 0 {
+		out = append(out, kerr("SLOT", "must be >= 0"))
 	}
 	return out
 }
@@ -324,12 +343,22 @@ func LoadDir(dir string) (*Registry, error) {
 // ErrNotFound is returned when no engine with the requested name exists.
 var ErrNotFound = errors.New("engine not found")
 
+// stripComment removes a trailing comment from an unquoted value. Quoting is
+// optional (ADR-0006), and an unquoted BUSY/PROGRESS legitimately contains
+// '#': the url#selector separator. So only a '#' that opens a comment (at the
+// start, or preceded by whitespace) starts one; a '#' glued between characters
+// is part of the value.
 func stripComment(v string) string {
 	if strings.HasPrefix(v, `"`) {
 		return v
 	}
-	if i := strings.Index(v, "#"); i >= 0 {
-		return v[:i]
+	for i := 0; i < len(v); i++ {
+		if v[i] != '#' {
+			continue
+		}
+		if i == 0 || v[i-1] == ' ' || v[i-1] == '\t' {
+			return v[:i]
+		}
 	}
 	return v
 }

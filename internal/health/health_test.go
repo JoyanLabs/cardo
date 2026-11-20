@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JoyanLabs/cardo/internal/probe"
 )
 
 // stallServer serves a HEALTH endpoint that answers non-200 with a JSON body
@@ -26,6 +29,15 @@ func stallServer(t *testing.T, progress func() (float64, bool)) *httptest.Server
 	return srv
 }
 
+func mustProbe(t *testing.T, value string) *probe.Probe {
+	t.Helper()
+	p, err := probe.Parse(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func TestWaitHealthyImmediately(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -34,11 +46,35 @@ func TestWaitHealthyImmediately(t *testing.T) {
 
 	alive := func() bool { return true }
 	start := time.Now()
-	if err := Wait(context.Background(), srv.URL, "", alive, 500*time.Millisecond); err != nil {
+	if err := Wait(context.Background(), srv.URL, nil, alive, 500*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(start) > 400*time.Millisecond {
 		t.Errorf("healthy engine took %v to confirm", time.Since(start))
+	}
+}
+
+// TestWaitAccepts2xxNotOnly200 pins "success is 2xx": a 204 (or any 2xx) is
+// healthy, a 3xx is not.
+func TestWaitAccepts2xxNotOnly200(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusNoContent, http.StatusPartialContent} {
+		code := code
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+			if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, 300*time.Millisecond); err != nil {
+				t.Errorf("%d must count as healthy: %v", code, err)
+			}
+		})
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPermanentRedirect)
+	}))
+	defer srv.Close()
+	if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, 120*time.Millisecond); !errors.Is(err, ErrStalled) {
+		t.Errorf("3xx must not count as healthy: %v", err)
 	}
 }
 
@@ -60,11 +96,65 @@ func TestWaitProgressChangeExtendsDeadline(t *testing.T) {
 	alive := func() bool { return true }
 
 	start := time.Now()
-	if err := Wait(context.Background(), srv.URL, "", alive, 150*time.Millisecond); err != nil {
+	if err := Wait(context.Background(), srv.URL, nil, alive, 150*time.Millisecond); err != nil {
 		t.Fatalf("progress changes must extend the deadline: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < 151*time.Millisecond {
 		t.Errorf("load finished in %v: deadline was not actually extended", elapsed)
+	}
+}
+
+// TestWaitStatusChangeExtendsDeadline pins the status-change reset: an
+// endpoint that keeps answering with a *different* status (503, 500, 503,
+// 500, ...) is making observable progress, so the window must keep moving.
+func TestWaitStatusChangeExtendsDeadline(t *testing.T) {
+	const stall = 150 * time.Millisecond
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		i := n.Add(1)
+		if i > 8 {
+			w.WriteHeader(http.StatusOK) // only reachable by extending the window
+			return
+		}
+		if i%2 == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		w.Write([]byte(`{"message":"loading"}`))
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall); err != nil {
+		t.Fatalf("changing statuses must extend the deadline: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < stall {
+		t.Errorf("load finished in %v: the status change never reset the window", elapsed)
+	}
+}
+
+// TestWaitIdenticalStatusForeverStalls pins the other side of the same rule:
+// one status served forever is NOT progress, however many times it answers.
+func TestWaitIdenticalStatusForeverStalls(t *testing.T) {
+	const stall = 150 * time.Millisecond
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"message":"loading"}`)) // identical body and status
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("an identical status forever must stall, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < stall {
+		t.Errorf("stalled after %v, before one full window", elapsed)
+	} else if elapsed > 4*stall {
+		t.Errorf("stalled after %v: an identical status kept resetting the window", elapsed)
 	}
 }
 
@@ -74,9 +164,24 @@ func TestWaitStuckProgressTimesOut(t *testing.T) {
 	srv := stallServer(t, func() (float64, bool) { return 0, false })
 	alive := func() bool { return true }
 
-	err := Wait(context.Background(), srv.URL+"/health", "", alive, 120*time.Millisecond)
+	err := Wait(context.Background(), srv.URL+"/health", nil, alive, 120*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("want ErrStalled, got %v", err)
+	}
+}
+
+// TestWaitRepeatedIdenticalProgressStalls pins that a numeric progress field
+// that never changes is not progress either.
+func TestWaitRepeatedIdenticalProgressStalls(t *testing.T) {
+	const stall = 150 * time.Millisecond
+	srv := stallServer(t, func() (float64, bool) { return 0.5, true }) // stuck at 0.5
+	start := time.Now()
+	err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("an unchanging numeric progress must stall, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*stall {
+		t.Errorf("stalled after %v: an identical progress kept resetting the window", elapsed)
 	}
 }
 
@@ -88,7 +193,7 @@ func TestWaitMessageOnlyChangeDoesNotExtend(t *testing.T) {
 	defer srv.Close()
 
 	alive := func() bool { return true }
-	err := Wait(context.Background(), srv.URL, "", alive, 120*time.Millisecond)
+	err := Wait(context.Background(), srv.URL, nil, alive, 120*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("message-only changes must not extend: %v", err)
 	}
@@ -111,7 +216,7 @@ func TestWaitProgressProbeResetsDeadline(t *testing.T) {
 
 	alive := func() bool { return true }
 	start := time.Now()
-	err := Wait(context.Background(), health.URL, progress.URL, alive, 150*time.Millisecond)
+	err := Wait(context.Background(), health.URL, mustProbe(t, progress.URL+"#$.progress"), alive, 150*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("want ErrStalled once progress stops, got %v", err)
 	}
@@ -120,9 +225,81 @@ func TestWaitProgressProbeResetsDeadline(t *testing.T) {
 	}
 }
 
+// TestWaitProgressProbeIsLoadBearing is the mutation guard for the PROGRESS
+// reset: the HEALTH endpoint answers 503 with no progress field of its own
+// and only turns 200 long after one stall window, while the PROGRESS endpoint
+// reports a ramp that then stops. Without the probe reset the wait gives up
+// before the load finishes; with it, the wait succeeds. The nil-probe run is
+// the negative control that proves the same servers stall out on their own.
+func TestWaitProgressProbeIsLoadBearing(t *testing.T) {
+	const stall = 300 * time.Millisecond
+	const progressRounds = 12 // polls that still report a *new* value
+
+	type load struct {
+		health   *httptest.Server
+		progress *httptest.Server
+		polls    *atomic.Int64 // PROGRESS polls
+		healthy  *atomic.Bool  // the HEALTH endpoint ever served a 2xx
+	}
+
+	newLoad := func() load {
+		var l load
+		l.polls = new(atomic.Int64)
+		l.healthy = new(atomic.Bool)
+		l.progress = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			n := l.polls.Add(1)
+			if n > progressRounds {
+				n = progressRounds // the load is stuck at its last value
+			}
+			fmt.Fprintf(w, `{"progress":%v}`, float64(n)/progressRounds)
+		}))
+		t.Cleanup(l.progress.Close)
+		l.health = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if l.polls.Load() > progressRounds {
+				l.healthy.Store(true)
+				w.WriteHeader(http.StatusOK) // answers only once the probe got there
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"message":"loading"}`))
+		}))
+		t.Cleanup(l.health.Close)
+		return l
+	}
+
+	t.Run("with probe succeeds past one window", func(t *testing.T) {
+		l := newLoad()
+		start := time.Now()
+		if err := Wait(context.Background(), l.health.URL, mustProbe(t, l.progress.URL+"#$.progress"),
+			func() bool { return true }, stall); err != nil {
+			t.Fatalf("the PROGRESS probe must carry the wait to health: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed < 2*stall {
+			t.Errorf("healthy after %v, want >= %v: the probe never extended the window", elapsed, 2*stall)
+		}
+		if l.polls.Load() <= progressRounds {
+			t.Errorf("succeeded after only %d progress polls: health was reached without the probe", l.polls.Load())
+		}
+		if !l.healthy.Load() {
+			t.Error("success must come from a 2xx HEALTH answer")
+		}
+	})
+
+	t.Run("without probe stalls", func(t *testing.T) {
+		l := newLoad()
+		err := Wait(context.Background(), l.health.URL, nil, func() bool { return true }, stall)
+		if !errors.Is(err, ErrStalled) {
+			t.Fatalf("negative control: without the PROGRESS probe the wait must stall, got %v", err)
+		}
+		if l.healthy.Load() {
+			t.Error("negative control: the engine reached health without the probe, so the probe is not load-bearing")
+		}
+	})
+}
+
 func TestWaitDeadEngineIsBroken(t *testing.T) {
 	alive := func() bool { return false }
-	err := Wait(context.Background(), "http://127.0.0.1:1/health", "", alive, time.Second)
+	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, alive, time.Second)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("want ErrBroken, got %v", err)
 	}
@@ -136,8 +313,25 @@ func TestWaitDeadEngineAfterProgressIsBroken(t *testing.T) {
 		return float64(changes) / 10, true
 	})
 	alive := func() bool { return changes < 4 }
-	err := Wait(context.Background(), srv.URL, "", alive, 150*time.Millisecond)
+	err := Wait(context.Background(), srv.URL, nil, alive, 150*time.Millisecond)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("want ErrBroken, got %v", err)
+	}
+}
+
+// TestWaitProbeFailureNeverSucceeds pins that a PROGRESS endpoint that cannot
+// answer never buys the wait extra time beyond one window.
+func TestWaitProbeFailureNeverSucceeds(t *testing.T) {
+	const stall = 150 * time.Millisecond
+	health := stallServer(t, func() (float64, bool) { return 0, false })
+	// A dead PROGRESS endpoint: the probe errors on every call.
+	start := time.Now()
+	err := Wait(context.Background(), health.URL, mustProbe(t, "http://127.0.0.1:1/progress#$.progress"),
+		func() bool { return true }, stall)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("a failing progress probe must not extend the wait, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*stall {
+		t.Errorf("waited %v on a probe that can never answer", elapsed)
 	}
 }

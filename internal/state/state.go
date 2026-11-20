@@ -51,8 +51,12 @@ func ResolveDir(stateHome string) string {
 	return filepath.Join(stateHome, "cardo")
 }
 
-// Load reads the state record. Missing file is ErrNoState; corrupt content
-// is a distinct error (a divergent record must be reported, not ignored).
+// currentVersion is the schema version Save writes and Load understands.
+const currentVersion = 1
+
+// Load reads the state record. Missing file is ErrNoState; corrupt content or
+// an unknown schema version is a distinct error (a divergent record must be
+// reported, not ignored, and never half-trusted as an ownership record).
 func (s *Store) Load() (*Record, error) {
 	b, err := os.ReadFile(s.path())
 	if errors.Is(err, os.ErrNotExist) {
@@ -65,12 +69,20 @@ func (s *Store) Load() (*Record, error) {
 	if err := json.Unmarshal(b, &r); err != nil {
 		return nil, fmt.Errorf("corrupt state file %s: %w", s.path(), err)
 	}
+	// Version 0 is a record written without the field (or hand-authored);
+	// anything else is a schema this cardo does not understand.
+	if r.Version != 0 && r.Version != currentVersion {
+		return nil, fmt.Errorf("unsupported state file version %d in %s: this cardo writes version %d; run `cardo down --forget` to start over",
+			r.Version, s.path(), currentVersion)
+	}
 	return &r, nil
 }
 
-// Save atomically replaces the state record: temp file, fsync, rename.
+// Save atomically replaces the state record: temp file, fsync, rename, and a
+// directory fsync so the rename itself is durable (the record is what tells a
+// rebooted host which engine cardo owns).
 func (s *Store) Save(r Record) error {
-	r.Version = 1
+	r.Version = currentVersion
 	if err := os.MkdirAll(s.Dir, 0o755); err != nil {
 		return err
 	}
@@ -94,7 +106,20 @@ func (s *Store) Save(r Record) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), s.path())
+	if err := os.Rename(tmp.Name(), s.path()); err != nil {
+		return err
+	}
+	return syncDir(s.Dir)
+}
+
+// syncDir flushes the directory entry so a rename survives a crash.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Clear removes the state file. Clearing an absent file is fine.

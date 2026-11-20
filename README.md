@@ -17,6 +17,7 @@ cardo list                 # registered engines and which one is up
 cardo status               # live state, memory in use
 cardo up vllm-qwen         # drain, stop, start, verify
 cardo down                 # stop the active engine, draining first
+cardo down --forget        # clear a stale record without stopping anything
 cardo watch                # what occupies the slot right now
 ```
 
