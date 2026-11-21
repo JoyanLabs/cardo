@@ -30,6 +30,12 @@ var ErrStalled = errors.New("health stalled: no progress within the WAIT window"
 // exited, or the wait was cancelled.
 var ErrBroken = errors.New("engine broken")
 
+// deadVerdicts is how many consecutive !alive() answers it takes to call an
+// engine broken. One flaky verdict (a container inspect that answers once
+// while docker is busy) must not condemn an engine that is still loading;
+// only a sustained run of them is evidence the process or container exited.
+const deadVerdicts = 3
+
 // maxPoll bounds the probe cadence; it is clamped against the stall window
 // so a short WAIT still polls fast enough to notice progress.
 const maxPoll = 1 * time.Second
@@ -49,19 +55,25 @@ func pollInterval(stall time.Duration) time.Duration {
 // Wait polls the health URL until it answers 2xx, extending the stall
 // deadline on observable progress. progress is the optional PROGRESS probe
 // (ADR-0005, passed parsed so the selector cannot be mangled); alive reports
-// whether the engine process/container is still alive. alive being false at
-// any point is ErrBroken.
+// whether the engine process/container is still alive. alive answering dead
+// deadVerdicts times in a row is ErrBroken (one flaky verdict is not).
 func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() bool, stall time.Duration) error {
 	deadline := time.Now().Add(stall)
 	cadence := pollInterval(stall)
 	portSeen := false
 	var lastProgress *float64
 	lastCode := -1 // no answer yet
+	dead := 0      // consecutive dead liveness verdicts
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for {
 		if !alive() {
-			return fmt.Errorf("%w: engine process or container exited while loading", ErrBroken)
+			dead++
+			if dead >= deadVerdicts {
+				return fmt.Errorf("%w: engine process or container exited while loading", ErrBroken)
+			}
+		} else {
+			dead = 0
 		}
 		if time.Now().After(deadline) {
 			if lastProgress != nil {

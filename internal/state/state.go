@@ -131,6 +131,11 @@ func (s *Store) Clear() error {
 	return err
 }
 
+// DirPath is the directory holding the record and the swap lockfile. It is
+// part of the surface the swap layer needs, so a test can wrap the store
+// without exposing the directory field.
+func (s *Store) DirPath() string { return s.Dir }
+
 func (s *Store) path() string {
 	return filepath.Join(s.Dir, fileName)
 }

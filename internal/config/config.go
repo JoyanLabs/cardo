@@ -144,11 +144,12 @@ func Parse(r io.Reader, file string) (*Engine, error) {
 		if _, dup := kv[key]; dup {
 			return nil, &KeyError{File: file, Line: n, Key: key, Reason: "duplicate key"}
 		}
-		// Trailing comments only apply to unquoted values; a quoted value may
-		// contain '#' (the BUSY/PROGRESS separator).
-		val = stripComment(val)
-		val = strings.TrimSpace(val)
-		val = strings.Trim(val, `"`)
+		// A quoted value runs to its closing quote and nothing after that
+		// quote is part of the value, so `KEY="v" # comment` cannot leak the
+		// comment into the value. An unquoted value keeps its glued '#'
+		// (the BUSY/PROGRESS url#selector separator) and loses only a
+		// whitespace-preceded comment (ADR-0006).
+		val = parseValue(val)
 		kv[key] = val
 		order = append(order, key)
 	}
@@ -342,6 +343,25 @@ func LoadDir(dir string) (*Registry, error) {
 
 // ErrNotFound is returned when no engine with the requested name exists.
 var ErrNotFound = errors.New("engine not found")
+
+// parseValue resolves the right-hand side of a KEY=value line. A value that
+// opens with a quote runs to the next quote and everything after it is noise
+// (a trailing comment, stray whitespace, whatever); an unquoted value keeps
+// its glued '#' because that is the url#selector separator, and loses only a
+// comment introduced by whitespace.
+func parseValue(v string) string {
+	if strings.HasPrefix(v, `"`) {
+		if end := strings.Index(v[1:], `"`); end >= 0 {
+			return v[1 : end+1]
+		}
+		// An unterminated quote: take what is there rather than eating the
+		// rest of the line as a comment.
+		return strings.TrimSpace(strings.TrimPrefix(v, `"`))
+	}
+	v = stripComment(v)
+	v = strings.TrimSpace(v)
+	return strings.Trim(v, `"`)
+}
 
 // stripComment removes a trailing comment from an unquoted value. Quoting is
 // optional (ADR-0006), and an unquoted BUSY/PROGRESS legitimately contains

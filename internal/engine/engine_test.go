@@ -65,6 +65,25 @@ func startDecoy(t *testing.T, args ...string) int {
 	return cmd.Process.Pid
 }
 
+// startDecoyArgv starts path with a caller-supplied argv (argv[0] included),
+// so a test can pin the exact command line a process reports in
+// /proc/<pid>/cmdline. It runs in its own process group so a mistaken
+// kill(-pid) cannot reach the test process.
+func startDecoyArgv(t *testing.T, path string, argv ...string) int {
+	t.Helper()
+	cmd := exec.Command(path)
+	cmd.Args = argv
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
+}
+
 // pidAlive reports whether pid exists and is not an unreaped zombie.
 func pidAlive(pid int) bool {
 	if pid <= 0 || syscall.Kill(pid, syscall.Signal(0)) != nil {
@@ -391,6 +410,92 @@ func TestCommandStopForeignPIDIsErrGoneAndNeverSignalled(t *testing.T) {
 	}
 }
 
+// TestCommandStopForeignShellCDeliverableIsErrGone reproduces the defect the
+// old guard allowed: a foreign `fish -c ...` (whose argv[0] also ends in
+// "sh") was killed by `cardo down` because the guard accepted any shell-ish
+// argv0, or any cmdline containing START's first token. cardo starts engines
+// as `sh -c <START>`, so anything whose argv[2] is not exactly START is not
+// ours and must be left running.
+func TestCommandStopForeignShellCDeliverableIsErrGone(t *testing.T) {
+	const foreignPayload = "sleep 79 & sleep 79"
+	foreign := startDecoyArgv(t, "sh", "/usr/bin/fish", "-c", foreignPayload)
+	// The ownership check must not be judged on the instant before the child
+	// finishes execing, when /proc still shows the parent's command line.
+	waitForExec(t, foreign, foreignPayload)
+
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sleep 42 & sleep 42")}
+	err := eng.Stop(context.Background(), Running{PID: foreign}, 500*time.Millisecond)
+	if !errors.Is(err, ErrGone) {
+		t.Fatalf("a foreign shell one-liner is not cardo's engine, got %v", err)
+	}
+	if !pidAlive(foreign) {
+		t.Errorf("cardo signalled a foreign process (pid %d is dead)", foreign)
+	}
+}
+
+// TestCommandStopShellWithoutDashCIsErrGone: a shell that was not started
+// with -c cannot be carrying cardo's START, so it is not ours either.
+func TestCommandStopShellWithoutDashCIsErrGone(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "someone-elses-loop.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 78\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := startDecoyArgv(t, "sh", "/bin/sh", script)
+	waitForExec(t, foreign, script)
+
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sleep 42 & sleep 42")}
+	err := eng.Stop(context.Background(), Running{PID: foreign}, 500*time.Millisecond)
+	if !errors.Is(err, ErrGone) {
+		t.Fatalf("a shell without -c is not cardo's engine, got %v", err)
+	}
+	if !pidAlive(foreign) {
+		t.Errorf("cardo signalled a foreign process (pid %d is dead)", foreign)
+	}
+}
+
+// TestStopRecordedPIDNeedsTheExactStart pins the reuse case: the same live
+// pid is cardo's only under the START that launched it. A different START
+// (a recycled pid, or a START edited in place) must be ErrGone with the
+// process left running, while the matching START still stops its group.
+func TestStopRecordedPIDNeedsTheExactStart(t *testing.T) {
+	const startA = "sleep 81 & sleep 81"
+	const startB = "sleep 82 & sleep 82"
+	ctx := context.Background()
+
+	first, err := New(dockerSpec(t, config.TypeCommand, "START", startA), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := first.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-running.PID, syscall.SIGKILL) })
+	waitForExec(t, running.PID, startA)
+
+	other, err := New(dockerSpec(t, config.TypeCommand, "START", startB), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Stop(ctx, running, 300*time.Millisecond); !errors.Is(err, ErrGone) {
+		t.Fatalf("an engine whose START differs must refuse the pid, got %v", err)
+	}
+	if !pidAlive(running.PID) {
+		t.Fatalf("the refused Stop killed a process the engine does not own (pid %d)", running.PID)
+	}
+
+	same, err := New(dockerSpec(t, config.TypeCommand, "START", startA), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := same.Stop(ctx, running, 3*time.Second); err != nil {
+		t.Fatalf("the matching engine must stop the recorded pid: %v", err)
+	}
+	if !waitForPIDDead(running.PID, 3*time.Second) {
+		t.Errorf("group leader %d survived Stop under its own START", running.PID)
+	}
+}
+
 // TestStopGonePIDIsTypedGone: a recorded pid that no longer exists cannot be
 // verified as ours, so it is typed ErrGone (the swap layer warns and moves
 // on) rather than silently nil.
@@ -439,7 +544,9 @@ func TestCommandStopUnreapedPIDIsNotAHang(t *testing.T) {
 		_, _ = cmd.Process.Wait()
 	})
 
-	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sh -c 'sleep 74 & sleep 74'")}
+	// The recorded pid was launched as `sh -c <START>`, so its START is the
+	// payload itself: the ownership check compares argv[2] against it exactly.
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sleep 74 & sleep 74")}
 	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {

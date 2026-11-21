@@ -228,8 +228,10 @@ func (c *commandEngine) Stop(ctx context.Context, running Running, grace time.Du
 	c.mu.Unlock()
 
 	if cmd == nil || cmd.Process.Pid != pid {
-		// A recorded PID from an earlier run: verify it still looks like this
-		// engine before signalling (ADR-0004 ownership check).
+		// A recorded PID from an earlier run: it is ours only if it still
+		// carries the exact `sh -c <START>` cardo launches (ADR-0004
+		// ownership check). Anything else is a foreign process: ErrGone,
+		// never a signal.
 		if !looksLikeEngine(pid, c.spec.Start) {
 			return fmt.Errorf("%w: recorded pid %d does not match engine %s", ErrGone, pid, c.spec.Name)
 		}
@@ -311,25 +313,27 @@ func processAlive(pid int) bool {
 	return !strings.HasPrefix(rest, "Z")
 }
 
-// looksLikeEngine verifies a recorded PID before cardo signals it: the
-// command engines cardo starts are `sh -c <START>`, so the process cmdline
-// must name sh (or the shell that replaced itself) — anything else is not
-// ours and must not be signalled.
+// looksLikeEngine verifies a recorded PID before cardo signals it. cardo
+// starts command engines as `sh -c <START>` (see commandEngine.Start), so the
+// process is ours only while its command line is still exactly that: argv[0]
+// a shell, argv[1] the -c flag, and argv[2] this engine's own START.
+//
+// Nothing weaker is safe. The previous rules (argv[0] ending in "sh", or the
+// cmdline merely containing START's first token) matched a foreign
+// `fish -c ...` that happened to mention the same word, and `cardo down`
+// killed it. A pid that does not carry our exact START is not ours: report
+// ErrGone and leave it running.
 func looksLikeEngine(pid int, start string) bool {
+	if start == "" {
+		return false
+	}
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil || len(b) == 0 {
 		return false
 	}
-	parts := strings.Split(string(b), "\x00")
-	if len(parts) == 0 {
+	argv := strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00")
+	if len(argv) < 3 {
 		return false
 	}
-	if strings.HasSuffix(parts[0], "sh") {
-		return true
-	}
-	// A START whose first token replaced the shell entirely.
-	if len(start) > 0 && strings.Contains(string(b), strings.Fields(start)[0]) {
-		return true
-	}
-	return false
+	return strings.HasSuffix(argv[0], "sh") && argv[1] == "-c" && argv[2] == start
 }

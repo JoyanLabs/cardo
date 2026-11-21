@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -154,6 +155,11 @@ func (p *Probe) fetchNumber(ctx context.Context) (int, error) {
 	f, ok := toFloat(v)
 	if !ok {
 		return 0, fmt.Errorf("probe %s: selector %s is not a number", p.URL, p.Selector)
+	}
+	// A fractional count is not a count: truncating 0.4 to 0 would answer
+	// "free" for an engine that is still serving, and the drain fails open.
+	if f != math.Trunc(f) {
+		return 0, fmt.Errorf("probe %s: selector %s is not an integer count: %v", p.URL, p.Selector, f)
 	}
 	return int(f), nil
 }

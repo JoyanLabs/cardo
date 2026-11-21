@@ -208,6 +208,49 @@ func TestParseTrailingCommentStillStripped(t *testing.T) {
 	}
 }
 
+// TestParseQuotedValueIgnoresTrailingComment pins the quoted half of
+// ADR-0006's optional quoting: once a value opens with a quote, its content
+// runs to the next quote and everything after it is noise. The old rule kept
+// `# the port is fixed by the slot` inside START, which then ran as arguments.
+func TestParseQuotedValueIgnoresTrailingComment(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "a.conf", `
+NAME=a
+TYPE=command
+START="/bin/serve --port 8080" # the port is fixed by the slot
+HEALTH=http://127.0.0.1:8080/health
+DESCRIPTION="quoted # keeps the hash"   	# and this one too
+`)
+	e, err := ParseFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Start != "/bin/serve --port 8080" {
+		t.Errorf("Start = %q, want the quoted content only", e.Start)
+	}
+	if e.Description != "quoted # keeps the hash" {
+		t.Errorf("Description = %q, want the quoted content with its own '#' kept", e.Description)
+	}
+}
+
+// TestParseUnquotedValueStillStripsWhitespaceComment is the other side of the
+// same rule and must not regress: an unquoted value keeps its glued '#'
+// (the url#selector separator) and loses only a whitespace-preceded comment.
+func TestParseUnquotedValueStillStripsWhitespaceComment(t *testing.T) {
+	dir := t.TempDir()
+	p := write(t, dir, "a.conf", "NAME=a\nTYPE=command\nSTART=/bin/serve # run it\nHEALTH=http://127.0.0.1:8080/health\nBUSY=http://127.0.0.1:8080/metrics#$.live.connections\n")
+	e, err := ParseFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Start != "/bin/serve" {
+		t.Errorf("Start = %q, want the comment stripped", e.Start)
+	}
+	if e.Busy == nil || e.Busy.URL != "http://127.0.0.1:8080/metrics" {
+		t.Errorf("Busy = %+v, want the glued '#' separator kept", e.Busy)
+	}
+}
+
 // TestValidateNumberRanges pins the ADR-0006 range rules that a successful
 // number conversion does not cover: DRAIN may be 0 (probe once and refuse),
 // WAIT must leave a positive stall window, SLOT is a non-negative index.

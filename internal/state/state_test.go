@@ -148,6 +148,30 @@ func TestSaveSurvivesReloadWithEveryField(t *testing.T) {
 	}
 }
 
+// TestSaveRoundTripsPreviousAt pins that the rollback timestamp is part of
+// the durable record, not a field swap sets and loses: `status` and a later
+// rollback decision both need to know when the previous engine was resident.
+func TestSaveRoundTripsPreviousAt(t *testing.T) {
+	dir := t.TempDir()
+	s := Store{Dir: dir}
+	at := time.Date(2025, 11, 20, 9, 13, 0, 0, time.UTC)
+	want := Record{Version: 1, Active: "red-snow-tabby", ActiveAt: at,
+		Previous: "tensorfold-qwen", PreviousAt: at.Add(-time.Hour)}
+	if err := s.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PreviousAt.Equal(want.PreviousAt) {
+		t.Errorf("PreviousAt = %v, want %v", got.PreviousAt, want.PreviousAt)
+	}
+	if !got.ActiveAt.Equal(at) {
+		t.Errorf("ActiveAt = %v, want %v", got.ActiveAt, at)
+	}
+}
+
 // TestSaveReportsAnUnsyncableDirectory pins that the durability step is real:
 // a rename is only durable once the directory entry is flushed, so a Save
 // that cannot fsync the directory must say so instead of reporting success.

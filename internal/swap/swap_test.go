@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -117,11 +118,63 @@ func (h *harness) healthServer(status func() int) string {
 	return srv.URL
 }
 
+// targetHealth answers 2xx only while the fake engine reports itself running.
+// `up` now refuses to start an engine whose HEALTH already answers, so a
+// happy-path test has to look like the cold port cardo itself is about to
+// warm up, not like an untracked engine holding the slot.
+func (h *harness) targetHealth(name string) string {
+	fe := h.engines[name]
+	return h.healthServer(func() int {
+		if fe.alive.Load() {
+			return http.StatusOK
+		}
+		return http.StatusServiceUnavailable
+	})
+}
+
+// failSaveStore makes one Save fail: the record of a running target cannot be
+// written, so the orphan guard has to stop what it just started.
+type failSaveStore struct {
+	Store
+	failFor string
+}
+
+func (f failSaveStore) Save(r state.Record) error {
+	if r.Active == f.failFor {
+		return errors.New("state dir is on fire")
+	}
+	return f.Store.Save(r)
+}
+
+// unreachableProbe is a BUSY probe no process will ever answer.
+func unreachableProbe() *config.Probe {
+	return &config.Probe{URL: "http://127.0.0.1:1/busy", Selector: mustSelector("$.live.connections")}
+}
+
+func mustSelector(sel string) *config.Selector {
+	s, err := config.ParseSelector(sel)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// deadResident makes every engine of the given name read as not running,
+// which is what a stale record looks like to the swap layer.
+func (h *harness) deadResident(names ...string) {
+	h.sw.Alive = func(_ context.Context, spec *config.Engine, _ engine.Running) bool {
+		for _, n := range names {
+			if spec.Name == n {
+				return false
+			}
+		}
+		return true
+	}
+}
+
 func TestUpWithoutStateStartsTarget(t *testing.T) {
 	h := newHarness(t, conf(t, "target"))
-	health := h.healthServer(func() int { return http.StatusOK })
-	spec := h.engines["target"].spec
-	spec.Health = health
+	h.engines["target"].spec.Health = h.targetHealth("target")
 
 	if err := h.sw.Up(context.Background(), "target"); err != nil {
 		t.Fatal(err)
@@ -142,7 +195,7 @@ func TestUpWithoutStateStartsTarget(t *testing.T) {
 // cardo actually started, so a later `down` can stop it.
 func TestUpRecordsStartedPID(t *testing.T) {
 	h := newHarness(t, conf(t, "target"))
-	h.engines["target"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
 
 	if err := h.sw.Up(context.Background(), "target"); err != nil {
 		t.Fatal(err)
@@ -156,10 +209,11 @@ func TestUpRecordsStartedPID(t *testing.T) {
 	}
 }
 
-// TestUpWarnsWhenHealthAlreadyAnswers pins the divergence warning: something
-// already answers the target's HEALTH before cardo starts it, which usually
-// means an untracked engine holds the slot.
-func TestUpWarnsWhenHealthAlreadyAnswers(t *testing.T) {
+// TestUpRefusesWhenTargetHealthAlreadyAnswers pins the slot guard: something
+// cardo did not start already answers the target's HEALTH, so starting the
+// target would double-book the slot. The swap is refused, not warned about,
+// and the target never starts; the record keeps `previous` for the operator.
+func TestUpRefusesWhenTargetHealthAlreadyAnswers(t *testing.T) {
 	h := newHarness(t, conf(t, "cold"), conf(t, "hot"))
 	// A stray process already serves the port cold is about to bind.
 	h.engines["cold"].spec.Health = h.healthServer(func() int { return http.StatusOK })
@@ -167,11 +221,22 @@ func TestUpWarnsWhenHealthAlreadyAnswers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := h.sw.Up(context.Background(), "cold"); err != nil {
-		t.Fatal(err)
+	err := h.sw.Up(context.Background(), "cold")
+	if !errors.Is(err, ErrSlotOccupied) {
+		t.Fatalf("want ErrSlotOccupied, got %v", err)
 	}
-	if !strings.Contains(h.out.String(), "already answers HEALTH") {
-		t.Errorf("expected a divergence warning, got %q", h.out.String())
+	if !strings.Contains(err.Error(), "already answers HEALTH of cold") {
+		t.Errorf("the refusal must name the endpoint that answered: %v", err)
+	}
+	if !strings.Contains(err.Error(), "down --forget") {
+		t.Errorf("the refusal must name the escape hatch: %v", err)
+	}
+	if len(h.engines["cold"].actions) != 0 {
+		t.Errorf("the target must never start on an occupied slot: %v", h.engines["cold"].actions)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "" || st.Previous != "hot" {
+		t.Errorf("cardo must not claim the untracked engine; the rollback target must survive: %+v", st)
 	}
 }
 
@@ -213,11 +278,7 @@ func TestUpDrainsCurrentBeforeStop(t *testing.T) {
 	if err := h.store.Save(state.Record{Version: 1, Active: "current"}); err != nil {
 		t.Fatal(err)
 	}
-	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer hts.Close()
-	h.engines["target"].spec.Health = hts.URL
+	h.engines["target"].spec.Health = h.targetHealth("target")
 
 	if err := h.sw.Up(context.Background(), "target"); err != nil {
 		t.Fatal(err)
@@ -244,7 +305,7 @@ func TestUpStopsResidentByRecordedPID(t *testing.T) {
 	cur.Drain = 0 // no BUSY probe: retire immediately, this test is about the handle
 	target := conf(t, "target")
 	h := newHarness(t, cur, target)
-	h.engines["target"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
 
 	const recordedPID = 424242
 	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: recordedPID}); err != nil {
@@ -264,7 +325,7 @@ func TestUpStopsResidentByRecordedPID(t *testing.T) {
 func TestPreviousIsTheEngineThisSwapStopped(t *testing.T) {
 	// Nothing resident but a stale rollback target in the record.
 	h := newHarness(t, conf(t, "target"))
-	h.engines["target"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
 	if err := h.store.Save(state.Record{Version: 1, Active: "", Previous: "long-gone"}); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +339,7 @@ func TestPreviousIsTheEngineThisSwapStopped(t *testing.T) {
 
 	// A real stop: previous is the engine that was resident.
 	h2 := newHarness(t, conf(t, "old"), conf(t, "target"))
-	h2.engines["target"].spec.Health = h2.healthServer(func() int { return http.StatusOK })
+	h2.engines["target"].spec.Health = h2.targetHealth("target")
 	if err := h2.store.Save(state.Record{Version: 1, Active: "old", ActivePID: h2.engines["old"].pid}); err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +481,7 @@ func TestDrainZeroWithFreeProceeds(t *testing.T) {
 	target := conf(t, "target")
 
 	h := newHarness(t, cur, target)
-	h.engines["target"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
 	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: h.engines["current"].pid}); err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +506,7 @@ func TestDrainZeroWithoutBusyProceedsImmediately(t *testing.T) {
 	target := conf(t, "target")
 
 	h := newHarness(t, cur, target)
-	h.engines["target"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
 	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: h.engines["current"].pid}); err != nil {
 		t.Fatal(err)
 	}
@@ -502,11 +563,7 @@ func TestMissingBusyDegradesToGraceWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer hts.Close()
-	h.engines["target"].spec.Health = hts.URL
+	h.engines["target"].spec.Health = h.targetHealth("target")
 
 	if err := h.sw.Up(context.Background(), "target"); err != nil {
 		t.Fatal(err)
@@ -774,6 +831,255 @@ func TestDownWithoutForgetRefusesUnconfiguredResident(t *testing.T) {
 	}
 }
 
+// TestRollbackHealthFailureRecordsUnverifiedPrevious pins the orphan the
+// rollback path used to create: the previous engine came back up as a live
+// process, its health wait then failed, and the record said nothing was
+// resident. A running process that cardo does not record is unkillable.
+func TestRollbackHealthFailureRecordsUnverifiedPrevious(t *testing.T) {
+	prev := conf(t, "prev")
+	prev.Drain = 0
+	prev.Health = "http://127.0.0.1:1/health" // comes up but never answers
+	prev.Wait = 1
+	target := conf(t, "target", "PRE_UP=exit 3")
+	h := newHarness(t, prev, target)
+	if err := h.store.Save(state.Record{Version: 1, Active: "prev", ActivePID: 515151}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, ErrSwapFailed) {
+		t.Fatalf("want ErrSwapFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "NOT verified healthy") {
+		t.Errorf("the failure must say the rollback is up but unverified: %v", err)
+	}
+	st, lerr := h.store.Load()
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	if st.Active != "prev" {
+		t.Errorf("the restored engine must stay recorded, got %+v", st)
+	}
+	if want := h.engines["prev"].pid; st.ActivePID != want {
+		t.Errorf("ActivePID = %d, want the pid of the process that is running (%d)", st.ActivePID, want)
+	}
+}
+
+// TestDownForgetClearsCorruptOrUnsupportedState is the escape hatch the state
+// loader itself points at. It must work in exactly the case the record cannot
+// be read at all; a plain `down` still refuses to guess.
+func TestDownForgetClearsCorruptOrUnsupportedState(t *testing.T) {
+	for _, body := range []string{"{not json at all", `{"version":99,"active":"a"}`} {
+		t.Run(body, func(t *testing.T) {
+			h := newHarness(t, conf(t, "a"))
+			path := filepath.Join(h.store.Dir, "state.json")
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := h.sw.Down(context.Background(), false); err == nil {
+				t.Fatal("a record cardo cannot read must not be quietly ignored")
+			}
+			if len(h.engines["a"].actions) != 0 {
+				t.Errorf("an unreadable record must not stop anything: %v", h.engines["a"].actions)
+			}
+			if err := h.sw.Down(context.Background(), true); err != nil {
+				t.Fatalf("down --forget is the escape hatch for an unreadable record, got %v", err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Errorf("the unreadable record must be gone, stat = %v", err)
+			}
+			if !strings.Contains(h.out.String(), "state record cleared") {
+				t.Errorf("--forget must say what it did: %q", h.out.String())
+			}
+		})
+	}
+}
+
+// TestUpRefusesWhenADeadResidentStillAnswersHealth pins the divergent record:
+// the process cardo recorded is gone, yet something still answers its HEALTH,
+// so the slot is held by an engine cardo never started. Draining a corpse and
+// stacking a second engine on the real occupant is the failure to prevent.
+func TestUpRefusesWhenADeadResidentStillAnswersHealth(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	target := conf(t, "target")
+	h := newHarness(t, cur, target)
+	h.engines["current"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	h.deadResident("current")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: h.engines["current"].pid}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, ErrSlotOccupied) {
+		t.Fatalf("want ErrSlotOccupied, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "already answers HEALTH of current") {
+		t.Errorf("the refusal must name the engine whose slot is held: %v", err)
+	}
+	if len(h.engines["current"].actions) != 0 || len(h.engines["target"].actions) != 0 {
+		t.Errorf("nothing may move: current=%v target=%v", h.engines["current"].actions, h.engines["target"].actions)
+	}
+}
+
+// TestUpSkipsDrainForADeadResident pins the dead-end the reviewers reproduced:
+// the recorded resident is not running, so there is nothing to drain, yet
+// asking its BUSY probe burned the whole DRAIN budget and aborted the swap
+// forever. Liveness is asked first.
+func TestUpSkipsDrainForADeadResident(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	cur.Busy = unreachableProbe() // nobody will ever answer
+	target := conf(t, "target")
+	h := newHarness(t, cur, target)
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	h.deadResident("current")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: h.engines["current"].pid}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := h.sw.Up(context.Background(), "target"); err != nil {
+		t.Fatalf("a swap away from a dead resident must proceed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the dead resident still cost %v: its drain was not skipped", elapsed)
+	}
+	if len(h.engines["current"].actions) != 0 {
+		t.Errorf("a dead resident must not be drained or stopped: %v", h.engines["current"].actions)
+	}
+	if !strings.Contains(h.out.String(), "current is not running; skipping drain and stop") {
+		t.Errorf("the skip must be said out loud: %q", h.out.String())
+	}
+	st, _ := h.store.Load()
+	if st.Active != "target" || st.Previous != "current" {
+		t.Errorf("state = %+v", st)
+	}
+}
+
+// TestDownSkipsDrainForADeadResident: the same dead-end hit `down`, which
+// aborted on an unreachable BUSY probe of a process that was already gone.
+func TestDownSkipsDrainForADeadResident(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	cur.Busy = unreachableProbe()
+	h := newHarness(t, cur)
+	h.deadResident("current")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: 616161}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if err := h.sw.Down(context.Background(), false); err != nil {
+		t.Fatalf("down must be able to clear a dead resident: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("down spent %v draining a process that is not running", elapsed)
+	}
+	if len(h.engines["current"].actions) != 0 {
+		t.Errorf("a dead resident must not be drained or stopped: %v", h.engines["current"].actions)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "" || st.ActivePID != 0 || st.Previous != "current" {
+		t.Errorf("the record must be cleared with previous kept: %+v", st)
+	}
+}
+
+// TestUpStillAbortsWhenAnAliveResidentCannotAnswerBusy is the control: the
+// skip is about liveness, not about a probe cardo does not like. A resident
+// that IS running still fails closed when BUSY cannot answer.
+func TestUpStillAbortsWhenAnAliveResidentCannotAnswerBusy(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	cur.Busy = unreachableProbe()
+	target := conf(t, "target")
+	h := newHarness(t, cur, target)
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: h.engines["current"].pid}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Up(context.Background(), "target")
+	if err == nil || !strings.Contains(err.Error(), "drain") {
+		t.Fatalf("an alive resident with an unanswerable BUSY must abort the swap, got %v", err)
+	}
+	if len(h.engines["current"].actions) != 0 || len(h.engines["target"].actions) != 0 {
+		t.Errorf("nothing may move: current=%v target=%v", h.engines["current"].actions, h.engines["target"].actions)
+	}
+}
+
+// TestRecordTimestampsStayInStepWithTheirFields pins record hygiene: a
+// `previous` without a timestamp is a rollback target nobody can date, and an
+// ActiveAt outliving the Active it describes is a lie about what is resident.
+func TestRecordTimestampsStayInStepWithTheirFields(t *testing.T) {
+	h := newHarness(t, conf(t, "a"), conf(t, "b"))
+	h.engines["a"].spec.Drain = 0
+	h.engines["b"].spec.Drain = 0
+	h.engines["b"].spec.Health = h.targetHealth("b")
+	if err := h.sw.Up(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "b" || st.ActiveAt.IsZero() {
+		t.Fatalf("up must stamp when the engine became resident: %+v", st)
+	}
+	if err := h.sw.Down(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = h.store.Load()
+	if !st.ActiveAt.IsZero() {
+		t.Errorf("down cleared Active but left ActiveAt = %v", st.ActiveAt)
+	}
+	if st.Previous != "b" || st.PreviousAt.IsZero() {
+		t.Errorf("down named a previous engine without stamping when: %+v", st)
+	}
+
+	h2 := newHarness(t, conf(t, "a"), conf(t, "b"))
+	h2.engines["a"].spec.Drain = 0
+	h2.engines["b"].spec.Drain = 0
+	h2.engines["a"].spec.Health = h2.targetHealth("a")
+	h2.engines["b"].spec.Health = h2.targetHealth("b")
+	if err := h2.sw.Up(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h2.sw.Up(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	st2, _ := h2.store.Load()
+	if st2.Previous != "b" || st2.PreviousAt.IsZero() {
+		t.Errorf("the rollback target of this swap must be stamped: %+v", st2)
+	}
+	if st2.Active != "a" || st2.ActiveAt.IsZero() {
+		t.Errorf("the resident must be stamped: %+v", st2)
+	}
+}
+
+// TestUpStopsTargetWhenTheRecordCannotBeSaved pins the orphan guard: an engine
+// that is running but not recorded as resident cannot be stopped by any later
+// cardo run, so a record that cannot be written must not leave it running.
+func TestUpStopsTargetWhenTheRecordCannotBeSaved(t *testing.T) {
+	h := newHarness(t, conf(t, "target"))
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	h.sw.State = failSaveStore{Store: h.store, failFor: "target"}
+
+	err := h.sw.Up(context.Background(), "target")
+	if err == nil {
+		t.Fatal("a record that cannot be written must fail the up")
+	}
+	if !strings.Contains(err.Error(), "on fire") {
+		t.Errorf("the failure must carry the state error: %v", err)
+	}
+	if got := h.engines["target"].stoppedPID(t); got != h.engines["target"].pid {
+		t.Errorf("the unrecordable target must be stopped, stopped %+v", h.engines["target"].stopped)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "" || st.ActivePID != 0 {
+		t.Errorf("the record must not claim an engine cardo could not record: %+v", st)
+	}
+}
+
 func TestUpUnknownNameIsTypedNotFound(t *testing.T) {
 	h := newHarness(t)
 	err := h.sw.Up(context.Background(), "nope")
@@ -799,13 +1105,71 @@ func TestLockBlocksConcurrentSwapper(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.store.Dir, "cardo.lock"), []byte("99999999"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer hts.Close()
-	h.engines["a"].spec.Health = hts.URL
+	h.engines["a"].spec.Health = h.targetHealth("a")
 	if err := h.sw.Up(context.Background(), "a"); err != nil {
 		t.Fatalf("stale lock must be broken, got %v", err)
+	}
+}
+
+// TestLockTreatsAnEmptyLockfileAsHeld pins the race two swappers used to lose:
+// a freshly created lockfile reads back as empty (pid 0), which the old code
+// called stale and deleted, so both runs believed they held the lock and each
+// unlocked the other. An empty lockfile is somebody's claim: refuse, and
+// leave it exactly where it is.
+func TestLockTreatsAnEmptyLockfileAsHeld(t *testing.T) {
+	h := newHarness(t, conf(t, "a"))
+	h.engines["a"].spec.Health = h.targetHealth("a")
+	path := filepath.Join(h.store.Dir, "cardo.lock")
+	if err := os.MkdirAll(h.store.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{"", "   \n", "not-a-pid"} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := h.sw.Up(context.Background(), "a")
+		if err == nil || !strings.Contains(err.Error(), "lock held") {
+			t.Fatalf("lockfile %q must be treated as held, got %v", body, err)
+		}
+		if b, rerr := os.ReadFile(path); rerr != nil || string(b) != body {
+			t.Errorf("the swapper must not delete a lockfile it does not own: content %q, read err %v", b, rerr)
+		}
+		if len(h.engines["a"].actions) != 0 {
+			t.Errorf("nothing may start while the lock is held: %v", h.engines["a"].actions)
+		}
+	}
+}
+
+// TestUnlockLeavesAForeignLockfileAlone pins the other half of the same race:
+// unlocking may only remove the file while it still names our pid.
+func TestUnlockLeavesAForeignLockfileAlone(t *testing.T) {
+	h := newHarness(t, conf(t, "a"))
+	h.engines["a"].spec.Health = h.targetHealth("a")
+	path := filepath.Join(h.store.Dir, "cardo.lock")
+
+	unlock, err := h.sw.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, rerr := os.ReadFile(path); rerr != nil || strings.TrimSpace(string(b)) != strconv.Itoa(os.Getpid()) {
+		t.Fatalf("the lock must name our pid, got %q (%v)", b, rerr)
+	}
+	// Another swapper takes the file over while we are running.
+	if err := os.WriteFile(path, []byte("808080"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if b, rerr := os.ReadFile(path); rerr != nil || string(b) != "808080" {
+		t.Errorf("unlock deleted a lockfile it no longer owns: content %q, read err %v", b, rerr)
+	}
+
+	// And it does remove its own.
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("unlock left our own lockfile behind: %v", statErr)
 	}
 }
 

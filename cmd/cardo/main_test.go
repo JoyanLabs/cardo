@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -218,8 +220,147 @@ func TestStatusAndListStillWork(t *testing.T) {
 }
 
 func demoConf(marker string) string {
-	return "NAME=demo\nTYPE=command\nSTART=sh -c 'sleep " + marker + " & sleep " + marker + "'\n" +
+	// START is the exact string cardo hands to `sh -c`, which is what
+	// resident() reproduces so cardo's ownership check sees its own engine.
+	return "NAME=demo\nTYPE=command\nSTART=sleep " + marker + " & sleep " + marker + "\n" +
 		"HEALTH=http://127.0.0.1:1/health\nDRAIN=0\nWAIT=5\nSLOT=0\n"
+}
+
+// foreignDecoy starts a process that only looks like a cardo engine: argv[0]
+// names some other program, and the payload is not any configured START. It
+// is a group leader so a signal would really take it down, which is exactly
+// the damage the ownership check has to prevent.
+func foreignDecoy(t *testing.T, argv0, payload string) int {
+	t.Helper()
+	cmd := exec.Command("sh")
+	cmd.Args = []string{argv0, "-c", payload}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if strings.Contains(string(b), payload) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("decoy %d never exec'd (cmdline %q)", pid, b)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_, _ = cmd.Process.Wait()
+	})
+	return pid
+}
+
+// TestDownRefusesToStopAForeignProcess is the CLI half of the ownership
+// check: a pid that does not carry cardo's exact START is reported, not
+// killed, and the stale record is still cleared for the operator.
+func TestDownRefusesToStopAForeignProcess(t *testing.T) {
+	c := newCLI(t, map[string]string{"demo.conf": demoConf("97")})
+	const payload = "sleep 9077 & sleep 9077"
+	pid := foreignDecoy(t, "/usr/bin/fish", payload)
+	c.writeState(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, pid))
+
+	code, out, errOut := capture(t, func() int { return run([]string{"down"}) })
+	if code != 0 {
+		t.Fatalf("down exit = %d, stdout=%q stderr=%q", code, out, errOut)
+	}
+	if !pidAlive(pid) {
+		t.Errorf("`cardo down` killed a process it does not own (pid %d)", pid)
+	}
+	if !strings.Contains(errOut, "already gone") {
+		t.Errorf("cardo must say the recorded pid was not its engine: stdout=%q stderr=%q", out, errOut)
+	}
+	if st := c.readState(); strings.Contains(st, `"active": "demo"`) {
+		t.Errorf("the stale record must still be cleared, got %s", st)
+	}
+}
+
+// TestDownForgetClearsACorruptRecord is the escape hatch the state loader
+// itself points at: it has to work precisely when the record cannot be read.
+func TestDownForgetClearsACorruptRecord(t *testing.T) {
+	for _, body := range []string{"{not json at all", `{"version":99,"active":"demo"}`} {
+		c := newCLI(t, map[string]string{"demo.conf": demoConf("99")})
+		c.writeState(body)
+
+		code, _, errOut := capture(t, func() int { return run([]string{"down"}) })
+		if code == 0 {
+			t.Fatalf("%q: a record cardo cannot read must not be ignored", body)
+		}
+		if !strings.Contains(errOut, "state") {
+			t.Errorf("%q: the failure must name the record: %q", body, errOut)
+		}
+
+		code, out, errOut := capture(t, func() int { return run([]string{"down", "--forget"}) })
+		if code != 0 {
+			t.Fatalf("--forget must clear an unreadable record: exit=%d stdout=%q stderr=%q", code, out, errOut)
+		}
+		if st := c.readState(); st != "" {
+			t.Errorf("the unreadable record must be gone, got %s", st)
+		}
+		if !strings.Contains(errOut, "state record cleared") {
+			t.Errorf("--forget must say what it did: %q", errOut)
+		}
+	}
+}
+
+// TestUpRefusesWhenTheSlotAlreadyAnswers is the CLI half of the slot guard:
+// an engine cardo never started answers the target's HEALTH, so `up` refuses
+// instead of double-booking the slot, and nothing is started or recorded.
+func TestUpRefusesWhenTheSlotAlreadyAnswers(t *testing.T) {
+	hot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hot.Close()
+	conf := strings.Replace(demoConf("98"), "http://127.0.0.1:1/health", hot.URL, 1)
+	c := newCLI(t, map[string]string{"demo.conf": conf})
+
+	code, out, errOut := capture(t, func() int { return run([]string{"up", "demo"}) })
+	if code == 0 {
+		t.Fatalf("`up` over an occupied slot must fail, stdout=%q stderr=%q", out, errOut)
+	}
+	for _, want := range []string{"already answers HEALTH of demo", "down --forget"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr must contain %q, got %q", want, errOut)
+		}
+	}
+	if st := c.readState(); strings.Contains(st, `"active": "demo"`) {
+		t.Errorf("cardo must not claim an engine it never started, got %s", st)
+	}
+}
+
+// TestStatusFlagsADeadResident pins the record hygiene of `status`: a pid in
+// the record is not a running engine, and reading "active" as "running" sends
+// the operator to the wrong machine.
+func TestStatusFlagsADeadResident(t *testing.T) {
+	c := newCLI(t, map[string]string{"demo.conf": demoConf("96")})
+	c.writeState(`{"version":1,"slot":0,"active":"demo","active_at":"2026-01-02T03:04:05Z","active_pid":99999999}`)
+
+	code, out, errOut := capture(t, func() int { return run([]string{"status"}) })
+	if code != 0 {
+		t.Fatalf("status exit = %d (stdout=%q stderr=%q)", code, out, errOut)
+	}
+	if !strings.Contains(out, "(not running?)") {
+		t.Errorf("status must question a resident whose pid is gone: %q", out)
+	}
+
+	// Control: a pid that is really there is reported without the warning.
+	live := c.resident("96")
+	code, out, errOut = capture(t, func() int { return run([]string{"status"}) })
+	if code != 0 {
+		t.Fatalf("status exit = %d (stdout=%q stderr=%q)", code, out, errOut)
+	}
+	if !strings.Contains(out, "active:   demo") {
+		t.Errorf("the live resident must be reported: %q", out)
+	}
+	if strings.Contains(out, "(not running?)") {
+		t.Errorf("pid %d is running; status must not question it: %q", live, out)
+	}
 }
 
 // pidAlive reports whether pid exists and is not an unreaped zombie.

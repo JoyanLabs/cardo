@@ -205,7 +205,14 @@ func doStatus(st *state.Store) int {
 	if rec.Active == "" {
 		fmt.Println("nothing resident")
 	} else {
-		fmt.Printf("active:   %s (since %s)\n", rec.Active, rec.ActiveAt.Format("2006-01-02 15:04:05"))
+		suffix := ""
+		// The record claims an engine by pid; if that pid is not a process,
+		// the operator must not read "active" as "running". The check is a
+		// signal-0 probe, so status never needs an engine driver.
+		if rec.ActivePID > 0 && syscall.Kill(rec.ActivePID, syscall.Signal(0)) != nil {
+			suffix = " (not running?)"
+		}
+		fmt.Printf("active:   %s (since %s)%s\n", rec.Active, rec.ActiveAt.Format("2006-01-02 15:04:05"), suffix)
 	}
 	if rec.Previous != "" {
 		fmt.Printf("previous: %s (rollback target)\n", rec.Previous)

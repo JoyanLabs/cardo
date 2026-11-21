@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -98,6 +99,46 @@ func TestCountNonNumberIsUnknown(t *testing.T) {
 	p := mustProbe(t, srv.URL+"#$.progress")
 	if _, err := p.Count(context.Background()); err == nil {
 		t.Fatal("string progress is not a count: want error")
+	}
+}
+
+// TestCountFractionalIsUnknown pins the truncation guard: a fractional count
+// is not a zero. int(0.4) == 0 would classify a half-loaded engine as Free
+// and let the drain swap over an engine that is still serving.
+func TestCountFractionalIsUnknown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"live":{"connections":0.4}}`))
+	}))
+	defer srv.Close()
+
+	p := mustProbe(t, srv.URL+"#$.live.connections")
+	if _, err := p.Count(context.Background()); err == nil {
+		t.Fatal("a fractional count must be an error, not a truncated 0")
+	}
+	res := p.Check(context.Background())
+	if res.State != Unknown {
+		t.Errorf("Check = %v, want Unknown (a fractional count is never Free)", res.State)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "not an integer count") {
+		t.Errorf("the error must name the shape it rejected, got %v", res.Err)
+	}
+}
+
+// TestCountIntegralFloatIsAccepted: the guard is about the fraction, not the
+// JSON type. An endpoint that reports 2.0 for two connections is a count.
+func TestCountIntegralFloatIsAccepted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`{"live":{"connections":2.0}}`))
+	}))
+	defer srv.Close()
+
+	p := mustProbe(t, srv.URL+"#$.live.connections")
+	n, err := p.Count(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("Count = %d, want 2", n)
 	}
 }
 

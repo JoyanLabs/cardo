@@ -297,6 +297,60 @@ func TestWaitProgressProbeIsLoadBearing(t *testing.T) {
 	})
 }
 
+// rampServer answers non-200 with a changing numeric progress until request
+// `healthyFrom`, then serves 200: a load that only finishes late.
+func rampServer(t *testing.T, healthyFrom int64) (*httptest.Server, *atomic.Int64) {
+	t.Helper()
+	var reqs atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		i := reqs.Add(1)
+		if i >= healthyFrom {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"progress":%v}`, float64(i)/100)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &reqs
+}
+
+// TestWaitToleratesOneTransientDeadVerdict pins A#7: one flaky liveness
+// verdict (a container inspect that answers "not running" once) must not
+// classify a loading engine broken. Only a run of consecutive dead verdicts
+// is evidence of a dead engine.
+func TestWaitToleratesOneTransientDeadVerdict(t *testing.T) {
+	const stall = 150 * time.Millisecond
+	srv, _ := rampServer(t, 8)
+	var verdicts atomic.Int64
+	alive := func() bool { return verdicts.Add(1) != 3 } // exactly one blip
+
+	if err := Wait(context.Background(), srv.URL, nil, alive, stall); err != nil {
+		t.Fatalf("a single transient dead verdict must not break the wait: %v", err)
+	}
+	if got := verdicts.Load(); got < 5 {
+		t.Errorf("the wait took %d liveness verdicts: it never got past the blip", got)
+	}
+}
+
+// TestWaitSustainedDeadVerdictsAreBroken is the other side of the tolerance:
+// a run of consecutive dead verdicts is still ErrBroken, and it must take the
+// whole run (one verdict alone must not condemn the engine).
+func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
+	const stall = 2 * time.Second
+	srv, _ := rampServer(t, 1000) // never reaches health within the test
+	var verdicts atomic.Int64
+	alive := func() bool { return verdicts.Add(1) < 3 } // dead from the 3rd on
+
+	err := Wait(context.Background(), srv.URL, nil, alive, stall)
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("a sustained dead verdict must be ErrBroken, got %v", err)
+	}
+	if got := verdicts.Load(); got < 5 {
+		t.Errorf("ErrBroken after %d liveness verdicts: only %d were dead, so the wait gave up before a run of three", got, got-2)
+	}
+}
+
 func TestWaitDeadEngineIsBroken(t *testing.T) {
 	alive := func() bool { return false }
 	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, alive, time.Second)

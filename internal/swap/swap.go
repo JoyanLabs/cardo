@@ -31,6 +31,12 @@ var ErrSwapFailed = errors.New("swap failed")
 // is a no-op and `up` has no rollback target.
 var ErrNothingResident = errors.New("nothing is resident: no engine to stop")
 
+// ErrSlotOccupied means an engine cardo did not start already answers the
+// HEALTH endpoint of the engine `up` wants to start. Putting a second engine
+// on that slot would double-book the GPU (ADR-0001), so cardo refuses instead
+// of warning and continuing.
+var ErrSlotOccupied = errors.New("slot already occupied")
+
 // ErrResidentUnconfigured means the state record names a resident engine
 // that no longer has a config file: cardo cannot stop what it cannot
 // describe, so it refuses to act destructively (ADR-0001/0004).
@@ -59,11 +65,20 @@ func httpNewRequest(ctx context.Context, url string) (*http.Request, error) {
 	return http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 }
 
+// Store is the state surface Swapper needs. *state.Store satisfies it; a test
+// can wrap it to make one write fail.
+type Store interface {
+	Load() (*state.Record, error)
+	Save(state.Record) error
+	Clear() error
+	DirPath() string
+}
+
 // Swapper runs swaps against a registry and a state store. Out receives
 // progress lines; tests capture it, the CLI prints it.
 type Swapper struct {
 	Registry *config.Registry
-	State    *state.Store
+	State    Store
 	Out      io.Writer
 
 	// Factory builds the engine driver for a spec; nil means engine.New.
@@ -128,6 +143,13 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 		previous = rec.Active
 	}
 	rec.Previous = previous
+	if previous != "" {
+		// The rollback target needs a timestamp of its own; a bare name cannot
+		// be dated later.
+		rec.PreviousAt = time.Now()
+	} else {
+		rec.PreviousAt = time.Time{}
+	}
 	rec.Active = ""
 	rec.ActiveAt = time.Time{}
 	rec.ActivePID = 0
@@ -145,10 +167,14 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 		}
 	}
 
-	// Divergence warning (examples/README lesson): if something already
-	// answers the target's HEALTH, an untracked engine may hold the slot.
-	if s.healthAlreadyUp(ctx, target) {
-		s.printf("warning: something already answers HEALTH of %s; an untracked engine may hold the slot", target.Name)
+	// Divergence guard (examples/README lesson): if something already answers
+	// the target's HEALTH, an untracked engine holds the slot and starting the
+	// target on top of it would double-book the GPU (ADR-0001). PRE_UP has
+	// already had its chance to free the endpoint. Nothing of the target has
+	// started, so refusing costs nothing, and `previous` still names the
+	// engine this swap stopped.
+	if err := s.refuseOccupied(ctx, target); err != nil {
+		return err
 	}
 
 	s.printf("starting %s", target.Name)
@@ -164,7 +190,17 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 	rec.ActiveAt = time.Now()
 	rec.ActivePID = running.PID
 	if err := s.State.Save(*rec); err != nil {
-		return err
+		// An engine that is running but not recorded as resident is invisible
+		// to every later `status` and `down`, so no cardo run can stop it
+		// again. Detach from the caller's context: the order to undo the start
+		// must not die with the command that failed to write.
+		stopCtx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
+		defer cancel()
+		if sErr := drv.Stop(stopCtx, running, 10*time.Second); sErr != nil && !errors.Is(sErr, engine.ErrGone) {
+			return fmt.Errorf("record started %s: %w; cardo could not stop the orphan either: %v", target.Name, err, sErr)
+		}
+		s.printf("warning: %s could not be recorded (%v) and was stopped again", target.Name, err)
+		return fmt.Errorf("record started %s: %w", target.Name, err)
 	}
 
 	s.printf("waiting for health of %s (stall timeout %ds)", target.Name, target.Wait)
@@ -196,6 +232,15 @@ func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) bool
 	return resp.StatusCode/100 == 2
 }
 
+// refuseOccupied turns "the HEALTH endpoint already answers" into the typed
+// refusal that stops a swap before a second engine is put on the same slot.
+func (s *Swapper) refuseOccupied(ctx context.Context, spec *config.Engine) error {
+	if !s.healthAlreadyUp(ctx, spec) {
+		return nil
+	}
+	return fmt.Errorf("%w: something already answers HEALTH of %s, so cardo will not start a second engine on that slot; whatever holds it is not recorded as resident, so inspect it and clear the record with `cardo down --forget` if it is stale", ErrSlotOccupied, spec.Name)
+}
+
 // failUp performs the rollback best effort on a detached context (a Ctrl-C
 // must not orphan the target or skip the restore) and wraps the cause.
 func (s *Swapper) failUp(ctx context.Context, rec *state.Record, previous string, target *config.Engine, drv engine.Engine, running engine.Running, cause error) error {
@@ -214,20 +259,44 @@ func (s *Swapper) failUp(ctx context.Context, rec *state.Record, previous string
 	}
 	rec.Active = ""
 	rec.ActivePID = 0
+	rec.ActiveAt = time.Time{}
 	if previous != "" {
 		s.printf("rolling back to %s", previous)
-		if rrunning, err := s.bringUp(cleanup, previous); err != nil {
+		prevSpec, haveSpec := s.Registry.Get(previous)
+		rrunning, rerr := s.bringUp(cleanup, previous)
+		if rerr != nil {
+			// A rollback target that is running but unverified is still a live
+			// process cardo has just started. A record that says nothing is
+			// resident makes it unkillable by any later `cardo down`, so the
+			// ownership stays recorded and the failure is said out loud.
+			if rrunning.PID > 0 && haveSpec && s.alive(cleanup, prevSpec, rrunning) {
+				rec.Active = previous
+				rec.ActiveAt = time.Now()
+				rec.ActivePID = rrunning.PID
+				if serr := s.State.Save(*rec); serr != nil {
+					return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy (%v), and recording it also failed: %v", ErrSwapFailed, cause, previous, rrunning.PID, rerr, serr)
+				}
+				return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy; it stays running and recorded, so check it and then `cardo down` (rollback health wait: %v)", ErrSwapFailed, cause, previous, rrunning.PID, rerr)
+			}
+			// It died or never came up: nothing of it may be left behind, and
+			// the record must not name a process that is not there.
+			if rrunning.PID > 0 && haveSpec {
+				if prevDrv, derr := s.driver(prevSpec); derr == nil {
+					if serr := prevDrv.Stop(cleanup, rrunning, 10*time.Second); serr != nil && !errors.Is(serr, engine.ErrGone) {
+						s.printf("warning: could not stop unverified rollback %s (pid %d): %v", previous, rrunning.PID, serr)
+					}
+				}
+			}
 			// Rollback is best effort and never recurs (ADR-0004). The
 			// state leaves nothing resident so the next `up` starts clean.
 			if err := s.State.Save(*rec); err != nil {
 				return err
 			}
-			return fmt.Errorf("%w: %v; rollback to %s also failed: %v", ErrSwapFailed, cause, previous, err)
-		} else {
-			rec.Active = previous
-			rec.ActiveAt = time.Now()
-			rec.ActivePID = rrunning.PID
+			return fmt.Errorf("%w: %v; rollback to %s also failed: %v", ErrSwapFailed, cause, previous, rerr)
 		}
+		rec.Active = previous
+		rec.ActiveAt = time.Now()
+		rec.ActivePID = rrunning.PID
 	}
 	if err := s.State.Save(*rec); err != nil {
 		return err
@@ -268,11 +337,25 @@ func (s *Swapper) Down(ctx context.Context, forget bool) error {
 	defer unlock()
 
 	rec, err := s.State.Load()
-	if errors.Is(err, state.ErrNoState) || (err == nil && rec.Active == "") {
+	if errors.Is(err, state.ErrNoState) {
 		return ErrNothingResident
 	}
 	if err != nil {
+		// The escape hatch must not depend on reading the record it exists to
+		// replace: a corrupt or future-schema state.json is exactly when
+		// `down --forget` is the only way forward, and it is the remedy the
+		// loader itself names. Without --forget cardo still refuses to guess.
+		if forget {
+			if err := s.State.Clear(); err != nil {
+				return err
+			}
+			s.printf("state record cleared")
+			return nil
+		}
 		return err
+	}
+	if rec.Active == "" {
+		return ErrNothingResident
 	}
 	if !forget {
 		if err := s.retire(ctx, rec.Active, rec.ActivePID); err != nil {
@@ -282,8 +365,10 @@ func (s *Swapper) Down(ctx context.Context, forget bool) error {
 		s.printf("forgetting %s without stopping it", rec.Active)
 	}
 	rec.Previous = rec.Active // the engine stopped by this operation
+	rec.PreviousAt = time.Now()
 	rec.Active = ""
 	rec.ActivePID = 0
+	rec.ActiveAt = time.Time{}
 	if err := s.State.Save(*rec); err != nil {
 		return err
 	}
@@ -300,15 +385,27 @@ func (s *Swapper) retire(ctx context.Context, name string, pid int) error {
 		// resident would double-book the slot (ADR-0001/0004).
 		return fmt.Errorf("%w: %q is recorded as resident but has no config file; start nothing over it, run `cardo down --forget` to clear the record", ErrResidentUnconfigured, name)
 	}
-	if err := s.drain(ctx, spec); err != nil {
-		return err
-	}
-	s.printf("stopping %s", name)
 	drv, err := s.driver(spec)
 	if err != nil {
 		return err
 	}
 	running := engine.Running{PID: pid, Container: spec.Container}
+
+	// Ask liveness before asking the resident anything at all. Draining puts
+	// a question to the process, and a process that is not running answers
+	// nothing: the BUSY probe would burn the whole DRAIN budget and abort the
+	// swap over an engine that is already gone.
+	if !s.alive(ctx, spec, running) {
+		s.printf("warning: %s is not running; skipping drain and stop", name)
+		// The record diverged from reality, and whatever holds the slot is not
+		// what cardo started. Do not stack another engine on it.
+		return s.refuseOccupied(ctx, spec)
+	}
+
+	if err := s.drain(ctx, spec); err != nil {
+		return err
+	}
+	s.printf("stopping %s", name)
 	if err := drv.Stop(ctx, running, 30*time.Second); err != nil && !errors.Is(err, engine.ErrGone) {
 		return err
 	} else if errors.Is(err, engine.ErrGone) {
@@ -471,29 +568,57 @@ func runHook(ctx context.Context, cmd string) error {
 }
 
 // lock takes the state-dir lockfile so two swappers cannot run (ADR-0004).
-// A lock held by a dead process is broken and taken over.
+// Only a lock whose owner is provably dead is broken and taken over.
 func (s *Swapper) lock() (func(), error) {
-	if err := os.MkdirAll(s.State.Dir, 0o755); err != nil {
+	dir := s.State.DirPath()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	path := s.State.Dir + "/cardo.lock"
+	path := dir + "/cardo.lock"
+	ours := strconv.Itoa(os.Getpid())
 	for attempt := 0; attempt < 2; attempt++ {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {
-			fmt.Fprintf(f, "%d\n", os.Getpid())
+			fmt.Fprintf(f, "%s\n", ours)
 			f.Close()
-			return func() { os.Remove(path) }, nil
+			// Unlock is ours-only: if anything replaced the file in the
+			// meantime, deleting it would release somebody else's lock.
+			return func() { s.unlock(path, ours) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, fmt.Errorf("lock: %v", err)
 		}
 		b, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return nil, fmt.Errorf("lock: %v", err)
+			// An unreadable lockfile may name a swapper that is very much
+			// alive: crossing it is not an option, and neither is deleting it.
+			return nil, fmt.Errorf("lock held: %s exists but cannot be read (%v); remove it only if no cardo is running", path, readErr)
 		}
-		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-		if pid > 0 && syscall.Kill(pid, syscall.Signal(0)) == nil {
+		pidText := strings.TrimSpace(string(b))
+		pid, convErr := strconv.Atoi(pidText)
+		if convErr != nil || pid <= 0 {
+			// Empty or garbage: it names no owner, but it is still somebody's
+			// claim, most likely a swapper that has just created the file and
+			// not yet written its pid. Taking it away would let two swappers
+			// both believe they hold the lock, and each would unlock the other's.
+			return nil, fmt.Errorf("lock held: %s does not name a pid (%q); remove it only if no cardo is running", path, pidText)
+		}
+		if syscall.Kill(pid, syscall.Signal(0)) == nil {
 			return nil, fmt.Errorf("another cardo run holds the lock (pid %d)", pid)
 		}
-		// Stale lock: remove it and retry the create once.
+		// The owner is provably dead: break the stale lock and retry the
+		// create once.
 		os.Remove(path)
 	}
 	return nil, fmt.Errorf("lock: could not acquire %s", path)
+}
+
+// unlock releases the lockfile, but only while it still names our pid. If the
+// content is not ours, the file belongs to somebody else now and stays put.
+func (s *Swapper) unlock(path, ours string) {
+	b, err := os.ReadFile(path)
+	if err != nil || strings.TrimSpace(string(b)) != ours {
+		return
+	}
+	os.Remove(path)
 }
