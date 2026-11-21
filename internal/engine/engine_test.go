@@ -390,17 +390,22 @@ func TestCommandStopRecordedPIDKillsGroup(t *testing.T) {
 	}
 }
 
-// TestCommandStopForeignPIDIsErrGoneAndNeverSignalled pins the ADR-0004
-// ownership guard: a recorded pid that does not look like this engine is
-// reported gone, and cardo must not lay a hand on it.
-func TestCommandStopForeignPIDIsErrGoneAndNeverSignalled(t *testing.T) {
+// TestCommandStopForeignPIDIsErrNotOursAndNeverSignalled pins the ADR-0004
+// ownership guard, split in two (Round-3 review, F1): a recorded pid that is
+// a live process but whose command line does not prove it is this engine's is
+// ErrNotOurs, not ErrGone. The slot is really held, so the caller must abort
+// rather than warn and start something over it. cardo never signals it.
+func TestCommandStopForeignPIDIsErrNotOursAndNeverSignalled(t *testing.T) {
 	foreign := startDecoy(t, "sleep", "73")
 	e := dockerSpec(t, config.TypeCommand, "START", "/nonexistent/cardo-engine-bin --serve")
 	eng := &commandEngine{spec: e}
 
 	err := eng.Stop(context.Background(), Running{PID: foreign}, 500*time.Millisecond)
-	if !errors.Is(err, ErrGone) {
-		t.Fatalf("want ErrGone for a pid cardo does not own, got %v", err)
+	if !errors.Is(err, ErrNotOurs) {
+		t.Fatalf("want ErrNotOurs for a live pid cardo does not own, got %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Errorf("a live process is not gone; the two outcomes must stay distinct: %v", err)
 	}
 	if !strings.Contains(err.Error(), fmt.Sprint(foreign)) {
 		t.Errorf("error must name the offending pid: %v", err)
@@ -410,13 +415,13 @@ func TestCommandStopForeignPIDIsErrGoneAndNeverSignalled(t *testing.T) {
 	}
 }
 
-// TestCommandStopForeignShellCDeliverableIsErrGone reproduces the defect the
-// old guard allowed: a foreign `fish -c ...` (whose argv[0] also ends in
+// TestCommandStopForeignShellCDeliverableIsErrNotOurs reproduces the defect
+// the old guard allowed: a foreign `fish -c ...` (whose argv[0] also ends in
 // "sh") was killed by `cardo down` because the guard accepted any shell-ish
 // argv0, or any cmdline containing START's first token. cardo starts engines
 // as `sh -c <START>`, so anything whose argv[2] is not exactly START is not
-// ours and must be left running.
-func TestCommandStopForeignShellCDeliverableIsErrGone(t *testing.T) {
+// ours and must be left running, reported as ErrNotOurs.
+func TestCommandStopForeignShellCDeliverableIsErrNotOurs(t *testing.T) {
 	const foreignPayload = "sleep 79 & sleep 79"
 	foreign := startDecoyArgv(t, "sh", "/usr/bin/fish", "-c", foreignPayload)
 	// The ownership check must not be judged on the instant before the child
@@ -425,17 +430,20 @@ func TestCommandStopForeignShellCDeliverableIsErrGone(t *testing.T) {
 
 	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sleep 42 & sleep 42")}
 	err := eng.Stop(context.Background(), Running{PID: foreign}, 500*time.Millisecond)
-	if !errors.Is(err, ErrGone) {
+	if !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("a foreign shell one-liner is not cardo's engine, got %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Errorf("pid %d is alive; ErrGone would let the swap start over it: %v", foreign, err)
 	}
 	if !pidAlive(foreign) {
 		t.Errorf("cardo signalled a foreign process (pid %d is dead)", foreign)
 	}
 }
 
-// TestCommandStopShellWithoutDashCIsErrGone: a shell that was not started
+// TestCommandStopShellWithoutDashCIsErrNotOurs: a shell that was not started
 // with -c cannot be carrying cardo's START, so it is not ours either.
-func TestCommandStopShellWithoutDashCIsErrGone(t *testing.T) {
+func TestCommandStopShellWithoutDashCIsErrNotOurs(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "someone-elses-loop.sh")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 78\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -445,7 +453,7 @@ func TestCommandStopShellWithoutDashCIsErrGone(t *testing.T) {
 
 	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "sleep 42 & sleep 42")}
 	err := eng.Stop(context.Background(), Running{PID: foreign}, 500*time.Millisecond)
-	if !errors.Is(err, ErrGone) {
+	if !errors.Is(err, ErrNotOurs) {
 		t.Fatalf("a shell without -c is not cardo's engine, got %v", err)
 	}
 	if !pidAlive(foreign) {
@@ -477,8 +485,11 @@ func TestStopRecordedPIDNeedsTheExactStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := other.Stop(ctx, running, 300*time.Millisecond); !errors.Is(err, ErrGone) {
-		t.Fatalf("an engine whose START differs must refuse the pid, got %v", err)
+	if err := other.Stop(ctx, running, 300*time.Millisecond); !errors.Is(err, ErrNotOurs) {
+		t.Fatalf("an engine whose START differs must refuse the live pid, got %v", err)
+	}
+	if errors.Is(err, ErrGone) {
+		t.Errorf("the process is alive: ErrGone would let `up` start over it: %v", err)
 	}
 	if !pidAlive(running.PID) {
 		t.Fatalf("the refused Stop killed a process the engine does not own (pid %d)", running.PID)
@@ -505,6 +516,100 @@ func TestStopGonePIDIsTypedGone(t *testing.T) {
 	if !errors.Is(err, ErrGone) {
 		t.Errorf("want ErrGone for a stale recorded pid, got %v", err)
 	}
+	if errors.Is(err, ErrNotOurs) {
+		t.Errorf("a pid that is no process at all must be proceedable ErrGone, not ErrNotOurs: %v", err)
+	}
+}
+
+// TestStopExecPrefixedStartStopsTheRecordedPID is the smoke case the reviewers
+// reproduced: START="exec sleep N" is the documented way to keep a command
+// engine in the foreground without a shell parent. dash replaces the shell
+// image with the payload, so /proc no longer shows `sh -c ...` at all: the
+// ownership proof has to recognise its own exec'd payload and stop it, instead
+// of reporting the engine as somebody else's.
+func TestStopExecPrefixedStartStopsTheRecordedPID(t *testing.T) {
+	const start = "exec sleep 297"
+	pid := startDecoy(t, "sh", "-c", start)
+	waitForExecedImage(t, pid, "sleep 297")
+
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", start)}
+	if err := eng.Stop(context.Background(), Running{PID: pid}, 3*time.Second); err != nil {
+		t.Fatalf("Stop of an exec'd START must succeed, got %v", err)
+	}
+	if !waitForPIDDead(pid, 3*time.Second) {
+		t.Errorf("pid %d survived Stop of its own exec'd START", pid)
+	}
+}
+
+// TestStopExecPrefixedStartNeedsTheSamePayload is the other half of the smoke:
+// the record says `exec sleep 296`, the config has since been edited to
+// `exec sleep 299`. The live process is not ours: ErrNotOurs, left running.
+func TestStopExecPrefixedStartNeedsTheSamePayload(t *testing.T) {
+	pid := startDecoy(t, "sh", "-c", "exec sleep 296")
+	waitForExecedImage(t, pid, "sleep 296")
+
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "exec sleep 299")}
+	err := eng.Stop(context.Background(), Running{PID: pid}, 500*time.Millisecond)
+	if !errors.Is(err, ErrNotOurs) {
+		t.Fatalf("an edited START must not prove ownership of a live pid, got %v", err)
+	}
+	if !pidAlive(pid) {
+		t.Errorf("cardo signalled a process it could not prove is its own (pid %d)", pid)
+	}
+}
+
+// TestStopRecordedPIDAcceptsAnyShPath pins argv[0] of the proof: cardo runs
+// `sh -c <START>`, and the shell it finds may be /bin/sh, /usr/bin/sh or a
+// busybox link. What matters is the last element of the path, which is also
+// what excludes fish and bash.
+func TestStopRecordedPIDAcceptsAnyShPath(t *testing.T) {
+	const start = "sleep 295 & sleep 295"
+	pid := startDecoyArgv(t, "sh", "/bin/sh", "-c", start)
+	waitForExec(t, pid, start)
+
+	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", start)}
+	if err := eng.Stop(context.Background(), Running{PID: pid}, 3*time.Second); err != nil {
+		t.Fatalf("Stop of a pid launched by /bin/sh: %v", err)
+	}
+	if !waitForPIDDead(pid, 3*time.Second) {
+		t.Errorf("pid %d survived Stop under its own START", pid)
+	}
+}
+
+// TestProvesOwnership exercises the ownership proof itself, argv shape by
+// argv shape. The real-process tests above cannot reach every shape (a shell
+// that execs its payload is gone before the test can look), so the table is
+// the spec for what may be signalled.
+func TestProvesOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		argv  []string
+		start string
+		want  bool
+	}{
+		{"exact start", []string{"sh", "-c", "sleep 1 & sleep 1"}, "sleep 1 & sleep 1", true},
+		{"sh by path", []string{"/usr/bin/sh", "-c", "sleep 1"}, "sleep 1", true},
+		{"exec prefixed payload", []string{"sh", "-c", "exec sleep 1"}, "sleep 1", true},
+		{"start already carries exec", []string{"sh", "-c", "exec sleep 1"}, "exec sleep 1", true},
+		{"exec'd payload of an exec start", []string{"sleep", "297"}, "exec sleep 297", true},
+		{"exec'd payload by absolute path", []string{"/usr/bin/sleep", "297"}, "exec /usr/bin/sleep 297", true},
+		{"fish is not sh", []string{"/usr/bin/fish", "-c", "sleep 1"}, "sleep 1", false},
+		{"bash is not sh", []string{"/bin/bash", "-c", "sleep 1"}, "sleep 1", false},
+		{"argv0 ending in sh is not enough", []string{"/usr/local/bin/fish", "-c", "sleep 1"}, "sleep 1", false},
+		{"no -c", []string{"sh", "loop.sh"}, "loop.sh", false},
+		{"different start", []string{"sh", "-c", "sleep 2"}, "sleep 1", false},
+		{"plain start cannot prove an exec'd image", []string{"sleep", "297"}, "sleep 297", false},
+		{"exec'd payload of another engine", []string{"sleep", "999"}, "exec sleep 297", false},
+		{"exec'd payload with extra args", []string{"sleep", "297", "x"}, "exec sleep 297", false},
+		{"too few argv", []string{"sh", "-c"}, "sleep 1", false},
+		{"empty start", []string{"sh", "-c", ""}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := provesOwnership(tc.argv, tc.start); got != tc.want {
+				t.Errorf("provesOwnership(%q, %q) = %v, want %v", tc.argv, tc.start, got, tc.want)
+			}
+		})
+	}
 }
 
 // waitForExec polls until the process image carries want in its command line.
@@ -523,6 +628,34 @@ func waitForExec(t *testing.T, pid int, want string) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// waitForExecedImage polls until the pid's command line is exactly want
+// (\0-separated argv), i.e. the shell has really replaced itself with the
+// payload: a substring check would also match `sh -c exec <payload>`.
+func waitForExecedImage(t *testing.T, pid int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		argv := strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00")
+		if !hasArgv(argv, "-c") && strings.Join(argv, " ") == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d never became %q (cmdline %q)", pid, want, b)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func hasArgv(argv []string, want string) bool {
+	for _, a := range argv {
+		if a == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestCommandStopUnreapedPIDIsNotAHang pins the other failure mode of a

@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,12 +32,25 @@ type fakeEngine struct {
 	stopped []engine.Running
 	healthy atomic.Bool
 	alive   atomic.Bool
+
+	// startErr makes Start fail after it has already mutated state, the
+	// shape of a `docker compose up -d` that creates half a project.
+	startErr error
+	// startDeadline records the deadline the caller put on the context, so
+	// the rollback budget is observable from the outside.
+	startDeadline time.Time
 }
 
 func (f *fakeEngine) Spec() *config.Engine { return f.spec }
-func (f *fakeEngine) Start(_ context.Context) (engine.Running, error) {
+func (f *fakeEngine) Start(ctx context.Context) (engine.Running, error) {
 	f.actions = append(f.actions, "start "+f.spec.Name)
-	f.alive.Store(true)
+	f.alive.Store(true) // state is mutated before any failure is reported
+	if d, ok := ctx.Deadline(); ok {
+		f.startDeadline = d
+	}
+	if f.startErr != nil {
+		return engine.Running{}, f.startErr
+	}
 	return engine.Running{PID: f.pid, Container: f.spec.Name}, nil
 }
 func (f *fakeEngine) Alive(_ context.Context, running engine.Running) bool {
@@ -118,18 +133,113 @@ func (h *harness) healthServer(status func() int) string {
 	return srv.URL
 }
 
-// targetHealth answers 2xx only while the fake engine reports itself running.
-// `up` now refuses to start an engine whose HEALTH already answers, so a
-// happy-path test has to look like the cold port cardo itself is about to
-// warm up, not like an untracked engine holding the slot.
+// targetHealth answers 2xx only while the fake engine reports itself running,
+// and refuses connections outright while it does not. `up` now treats any
+// HTTP answer (not only a 2xx) as "the slot is occupied", so a happy-path
+// test has to look like a cold port cardo itself is about to warm up: a
+// server that answers 503 is an occupant, not an absence.
 func (h *harness) targetHealth(name string) string {
 	fe := h.engines[name]
-	return h.healthServer(func() int {
-		if fe.alive.Load() {
-			return http.StatusOK
+	return h.gatedHealth(func() bool { return fe.alive.Load() })
+}
+
+// gatedListener refuses connections (a transport-level failure, which is what
+// a free port really looks like) while closed, and hands them to the server
+// once open.
+type gatedListener struct {
+	net.Listener
+	open func() bool
+}
+
+func (g *gatedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := g.Listener.Accept()
+		if err != nil {
+			return nil, err
 		}
-		return http.StatusServiceUnavailable
+		if g.open == nil || g.open() {
+			return c, nil
+		}
+		c.Close() // nobody home: the client sees a transport failure
+	}
+}
+
+// gatedHealth serves 200 on a port that refuses connections until open says
+// otherwise.
+func (h *harness) gatedHealth(open func() bool) string {
+	h.t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Listener = &gatedListener{Listener: ln, open: open}
+	srv.Start()
+	h.t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// useRealDriver routes the named engines through the real engine.New, so the
+// ownership check inside commandEngine.Stop is the one under test.
+func (h *harness) useRealDriver(names ...string) {
+	h.t.Helper()
+	real := map[string]bool{}
+	for _, n := range names {
+		real[n] = true
+	}
+	base := h.sw.Factory
+	h.sw.Factory = func(spec *config.Engine) (engine.Engine, error) {
+		if real[spec.Name] {
+			return engine.New(spec, engine.Options{})
+		}
+		return base(spec)
+	}
+}
+
+// startForeignShell starts a live process that is not any configured engine
+// and returns its pid, waiting until /proc really shows the payload.
+func startForeignShell(t *testing.T, payload string) int {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", payload)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_, _ = cmd.Process.Wait()
 	})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if strings.Contains(string(b), payload) {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("foreign decoy %d never ran %q (cmdline %q)", pid, payload, b)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// mutateStore runs a callback after every Save, so a test can change the
+// world at the exact moment the swap layer writes its record.
+type mutateStore struct {
+	Store
+	after func(state.Record)
+}
+
+func (m mutateStore) Save(r state.Record) error {
+	if err := m.Store.Save(r); err != nil {
+		return err
+	}
+	if m.after != nil {
+		m.after(r)
+	}
+	return nil
 }
 
 // failSaveStore makes one Save fail: the record of a running target cannot be
@@ -209,53 +319,288 @@ func TestUpRecordsStartedPID(t *testing.T) {
 	}
 }
 
-// TestUpRefusesWhenTargetHealthAlreadyAnswers pins the slot guard: something
-// cardo did not start already answers the target's HEALTH, so starting the
-// target would double-book the slot. The swap is refused, not warned about,
-// and the target never starts; the record keeps `previous` for the operator.
+// TestUpRefusesWhenTargetHealthAlreadyAnswers pins the slot guard, and since
+// round 3 also its rollback: something cardo did not start already answers
+// the target's HEALTH (any status code at all — a 404 from an nginx holds the
+// port just as hard as a 200), so the swap is refused, the target never
+// starts, and the engine this swap retired is brought back up and recorded as
+// resident again. The refusal may not advise `down --forget` here: the record
+// now names a live engine cardo owns, and forgetting it would orphan it.
 func TestUpRefusesWhenTargetHealthAlreadyAnswers(t *testing.T) {
-	h := newHarness(t, conf(t, "cold"), conf(t, "hot"))
-	// A stray process already serves the port cold is about to bind.
-	h.engines["cold"].spec.Health = h.healthServer(func() int { return http.StatusOK })
-	if err := h.store.Save(state.Record{Version: 1, Active: "hot", ActivePID: h.engines["hot"].pid}); err != nil {
-		t.Fatal(err)
+	for _, code := range []int{http.StatusOK, http.StatusNotFound, http.StatusServiceUnavailable} {
+		code := code
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			h := newHarness(t, conf(t, "cold"), conf(t, "hot"))
+			h.engines["hot"].spec.Drain = 0
+			// A stray process already serves the port cold is about to bind.
+			h.engines["cold"].spec.Health = h.healthServer(func() int { return code })
+			h.engines["hot"].spec.Health = h0health(t)
+			if err := h.store.Save(state.Record{Version: 1, Active: "hot", ActivePID: h.engines["hot"].pid}); err != nil {
+				t.Fatal(err)
+			}
+
+			err := h.sw.Up(context.Background(), "cold")
+			if !errors.Is(err, ErrSlotOccupied) {
+				t.Fatalf("want ErrSlotOccupied for a %d occupant, got %v", code, err)
+			}
+			if !errors.Is(err, ErrSwapFailed) {
+				t.Errorf("a refusal that had to roll back is also a failed swap: %v", err)
+			}
+			if !strings.Contains(err.Error(), "already answers HEALTH of cold") {
+				t.Errorf("the refusal must name the endpoint that answered: %v", err)
+			}
+			if !strings.Contains(err.Error(), "the previous engine was restored") {
+				t.Errorf("the refusal must say the retired engine came back: %v", err)
+			}
+			if !strings.Contains(err.Error(), "investigate what answers HEALTH") {
+				t.Errorf("the refusal must name the thing to go look at: %v", err)
+			}
+			if strings.Contains(err.Error(), "down --forget") {
+				t.Errorf("the record now names a live cardo-owned engine; --forget would orphan it: %v", err)
+			}
+			if len(h.engines["cold"].actions) != 0 {
+				t.Errorf("the target must never start on an occupied slot: %v", h.engines["cold"].actions)
+			}
+			if !containsAction(h.engines["hot"].actions, "start hot") {
+				t.Errorf("the engine this swap retired must be started again: %v", h.engines["hot"].actions)
+			}
+			st, _ := h.store.Load()
+			if st.Active != "hot" || st.ActivePID != h.engines["hot"].pid {
+				t.Errorf("the restored engine must be recorded as resident again: %+v", st)
+			}
+			if st.Previous != "hot" {
+				t.Errorf("the rollback target must survive: %+v", st)
+			}
+		})
 	}
+}
+
+// TestUpRefusalWithNoPreviousKeepsTheRecordEmpty is the other half of the
+// refusal message: nothing was resident, so nothing was restored, and the
+// record must stay empty. Advising `down --forget` there is noise about a
+// record that names nothing.
+func TestUpRefusalWithNoPreviousKeepsTheRecordEmpty(t *testing.T) {
+	h := newHarness(t, conf(t, "cold"))
+	h.engines["cold"].spec.Health = h.healthServer(func() int { return http.StatusTeapot })
 
 	err := h.sw.Up(context.Background(), "cold")
 	if !errors.Is(err, ErrSlotOccupied) {
 		t.Fatalf("want ErrSlotOccupied, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "already answers HEALTH of cold") {
-		t.Errorf("the refusal must name the endpoint that answered: %v", err)
+	if strings.Contains(err.Error(), "down --forget") {
+		t.Errorf("nothing is recorded, so --forget is not the remedy: %v", err)
 	}
-	if !strings.Contains(err.Error(), "down --forget") {
-		t.Errorf("the refusal must name the escape hatch: %v", err)
+	if strings.Contains(err.Error(), "the previous engine was restored") {
+		t.Errorf("there was no previous engine: %v", err)
 	}
 	if len(h.engines["cold"].actions) != 0 {
-		t.Errorf("the target must never start on an occupied slot: %v", h.engines["cold"].actions)
+		t.Errorf("the target must never start: %v", h.engines["cold"].actions)
 	}
 	st, _ := h.store.Load()
-	if st.Active != "" || st.Previous != "hot" {
-		t.Errorf("cardo must not claim the untracked engine; the rollback target must survive: %+v", st)
+	if st.Active != "" || st.ActivePID != 0 || st.Previous != "" {
+		t.Errorf("the record must stay empty: %+v", st)
 	}
 }
 
-// TestUpSilentWhenHealthIsFreeBeforeStart: the warning is only for an
-// endpoint that already answers, not for a cold port that cardo itself is
-// about to bring up.
+// TestUpRefusalKeepsTheRecordOfADeadResident is the dead-resident variant:
+// the process cardo recorded is gone but something still answers its HEALTH.
+// The refusal happens inside retire, before the record is touched, so the
+// record must still name the resident it could not stop — and only there is
+// `down --forget` the right advice, because that record really is stale.
+func TestUpRefusalKeepsTheRecordOfADeadResident(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	target := conf(t, "target")
+	h := newHarness(t, cur, target)
+	h.engines["current"].spec.Health = h.healthServer(func() int { return http.StatusOK })
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	h.deadResident("current")
+	const recordedPID = 616161
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: recordedPID}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, ErrSlotOccupied) {
+		t.Fatalf("want ErrSlotOccupied, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "already answers HEALTH of current") {
+		t.Errorf("the refusal must name the held slot: %v", err)
+	}
+	if !strings.Contains(err.Error(), "down --forget") {
+		t.Errorf("a stale record is exactly what --forget is for: %v", err)
+	}
+	if len(h.engines["current"].actions) != 0 || len(h.engines["target"].actions) != 0 {
+		t.Errorf("nothing may move: current=%v target=%v", h.engines["current"].actions, h.engines["target"].actions)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "current" || st.ActivePID != recordedPID {
+		t.Errorf("the refusal must leave the record it could not verify intact: %+v", st)
+	}
+}
+
+// TestUpAbortsWhenTheRecordedResidentIsAliveButNotOurs is the double-booking
+// guard the reviewers asked for at the swap layer: the recorded pid is a live
+// process whose command line is not this engine's START. That is not "the
+// resident was already gone" — the slot is held — so the retire aborts, the
+// record survives, and nothing is started over it.
+func TestUpAbortsWhenTheRecordedResidentIsAliveButNotOurs(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	cur.Start = "sleep 42 & sleep 42" // not what the live decoy runs
+	target := conf(t, "target")
+	h := newHarness(t, cur, target)
+	h.useRealDriver("current")
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	foreign := startForeignShell(t, "sleep 79 & sleep 79")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: foreign}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, engine.ErrNotOurs) {
+		t.Fatalf("want engine.ErrNotOurs, got %v", err)
+	}
+	if errors.Is(err, engine.ErrGone) {
+		t.Errorf("a live process must never take the warn-and-proceed path: %v", err)
+	}
+	if strings.Contains(h.out.String(), "was already gone") {
+		t.Errorf("the swap must not call a live foreign process gone: %q", h.out.String())
+	}
+	if len(h.engines["target"].actions) != 0 {
+		t.Errorf("nothing may start on a slot a live process holds: %v", h.engines["target"].actions)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "current" || st.ActivePID != foreign {
+		t.Errorf("the record must survive for the operator: %+v", st)
+	}
+	if !pidAlive(foreign) {
+		t.Errorf("cardo killed a process it could not prove was its own (pid %d)", foreign)
+	}
+}
+
+// TestDownAbortsWhenTheRecordedResidentIsAliveButNotOurs: `down` has the same
+// double-booking stake as `up`, and a record cardo cannot honour must not be
+// cleared either.
+func TestDownAbortsWhenTheRecordedResidentIsAliveButNotOurs(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Drain = 0
+	cur.Start = "sleep 42 & sleep 42" // not what the live decoy runs
+	h := newHarness(t, cur)
+	h.useRealDriver("current")
+	foreign := startForeignShell(t, "sleep 78 & sleep 78")
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", ActivePID: foreign}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.sw.Down(context.Background(), false)
+	if !errors.Is(err, engine.ErrNotOurs) {
+		t.Fatalf("want engine.ErrNotOurs, got %v", err)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "current" || st.ActivePID != foreign {
+		t.Errorf("a down that could not stop the resident must not clear the record: %+v", st)
+	}
+	if !pidAlive(foreign) {
+		t.Errorf("cardo killed a process it does not own (pid %d)", foreign)
+	}
+	// The escape hatch still works, and it is the only way out.
+	if err := h.sw.Down(context.Background(), true); err != nil {
+		t.Fatalf("down --forget must stay reachable: %v", err)
+	}
+}
+
+// TestUpStopsTheTargetWhenStartFails pins the partially-created engine: a
+// Start that fails after creating something (half a compose project, a
+// container that will not start) must still be handed to Stop, and its
+// POST_DOWN must run, instead of being dropped because there is no handle.
+func TestUpStopsTheTargetWhenStartFails(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "postdown.ran")
+	target := conf(t, "target", "POST_DOWN=touch "+marker)
+	h := newHarness(t, target)
+	h.engines["target"].spec.Health = h.targetHealth("target")
+	h.engines["target"].startErr = errors.New("compose created half a project and gave up")
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, ErrSwapFailed) {
+		t.Fatalf("want ErrSwapFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "half a project") {
+		t.Errorf("the cause must survive: %v", err)
+	}
+	if !containsAction(h.engines["target"].actions, "stop target") {
+		t.Errorf("the driver must be asked to stop what a failed Start may have created: %v", h.engines["target"].actions)
+	}
+	if _, serr := os.Stat(marker); serr != nil {
+		t.Errorf("the target's POST_DOWN must run after a failed Start (its teardown is how a half-created project is cleaned up): %v", serr)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "" || st.ActivePID != 0 {
+		t.Errorf("nothing is resident: %+v", st)
+	}
+}
+
+// TestRollbackCleanupContextOutlivesTheBaseCleanupBudget pins F3: examples
+// set WAIT=300, so a rollback that restores the previous engine needs its own
+// health wait to fit inside the detached cleanup context. The base 2m budget
+// silently truncates a 300s load.
+func TestRollbackCleanupContextOutlivesTheBaseCleanupBudget(t *testing.T) {
+	prev := conf(t, "prev")
+	prev.Drain = 0
+	prev.Wait = 45
+	prev.Health = h0health(t)
+	target := conf(t, "target", "PRE_UP=exit 3")
+	h := newHarness(t, prev, target)
+	if err := h.store.Save(state.Record{Version: 1, Active: "prev", ActivePID: h.engines["prev"].pid}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.sw.Up(context.Background(), "target"); !errors.Is(err, ErrSwapFailed) {
+		t.Fatalf("want ErrSwapFailed, got %v", err)
+	}
+	if h.engines["prev"].startDeadline.IsZero() {
+		t.Fatal("the rollback never started the previous engine")
+	}
+	if got := time.Until(h.engines["prev"].startDeadline); got <= cleanupBudget {
+		t.Errorf("the rollback health wait got %v of cleanup budget; with previous=%q (WAIT=%ds) it must outlast the base %v",
+			got, "prev", prev.Wait, cleanupBudget)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "prev" {
+		t.Errorf("the rollback must still restore the record: %+v", st)
+	}
+}
+
+// TestCleanupBudgetForFallsBackToTheBaseBudget pins the budget arithmetic
+// itself, including the two cases that must not be extended.
+func TestCleanupBudgetForFallsBackToTheBaseBudget(t *testing.T) {
+	prev := conf(t, "prev")
+	prev.Wait = 300
+	h := newHarness(t, prev, conf(t, "target"))
+
+	if got := h.sw.cleanupBudgetFor(""); got != cleanupBudget {
+		t.Errorf("cleanupBudgetFor(\"\") = %v, want the base %v", got, cleanupBudget)
+	}
+	if got := h.sw.cleanupBudgetFor("no-such-engine"); got != cleanupBudget {
+		t.Errorf("a registry miss = %v, want the base %v", got, cleanupBudget)
+	}
+	got := h.sw.cleanupBudgetFor("prev")
+	if got <= cleanupBudget+300*time.Second {
+		t.Errorf("cleanupBudgetFor(prev) = %v, want the base %v plus the engine's 300s WAIT and a margin", got, cleanupBudget)
+	}
+}
+
+// TestSilentWhenHealthIsFreeBeforeStart: the refusal is only for an endpoint
+// that answers, not for a port nothing is listening on.
 func TestUpSilentWhenHealthIsFreeBeforeStart(t *testing.T) {
 	h := newHarness(t, conf(t, "target"))
-	h.engines["target"].spec.Health = h.healthServer(func() int {
-		if h.engines["target"].alive.Load() {
-			return http.StatusOK // only cardo's own start makes it answer
-		}
-		return http.StatusServiceUnavailable
-	})
+	h.engines["target"].spec.Health = h.targetHealth("target")
 	if err := h.sw.Up(context.Background(), "target"); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(h.out.String(), "already answers HEALTH") {
-		t.Errorf("a cold engine must not be warned about: %q", h.out.String())
+		t.Errorf("a cold engine must not be refused: %q", h.out.String())
 	}
 }
 

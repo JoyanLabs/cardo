@@ -48,8 +48,21 @@ var ErrResidentUnconfigured = errors.New("resident engine has no config; refusin
 var hookTimeout = 60 * time.Second
 
 // cleanupBudget bounds the detached rollback/cleanup context (ADR-0004:
-// rollback is best effort and its own failure is reported loudly).
-const cleanupBudget = 2 * time.Minute
+// rollback is best effort and its own failure is reported loudly). It is a
+// variable so a test can shrink it and see whether a rollback still has room
+// to wait for health; the real budget a cleanup gets is cleanupBudgetFor.
+var cleanupBudget = 2 * time.Minute
+
+// cleanupBudgetMargin covers everything a rollback has to do besides
+// previous's own health wait: starting it, the poll cadence, and saving the
+// record.
+const cleanupBudgetMargin = 15 * time.Second
+
+// healthProbeTimeout bounds one divergence-guard request. It is short on
+// purpose: the guard must not stall a swap behind a wedged endpoint, and a
+// server that does not answer in time is not holding the slot in any way
+// cardo can act on.
+const healthProbeTimeout = 3 * time.Second
 
 // client is the package HTTP client for cardo's own one-shot requests (the
 // divergence warning). It is shared so no swap ever leaks a connection pool,
@@ -173,8 +186,23 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 	// already had its chance to free the endpoint. Nothing of the target has
 	// started, so refusing costs nothing, and `previous` still names the
 	// engine this swap stopped.
-	if err := s.refuseOccupied(ctx, target); err != nil {
-		return err
+	//
+	// The refusal happens after the resident was retired, so it must leave the
+	// swap where it started: rolling back restores the engine this swap stopped
+	// and records it resident again, instead of leaving it stopped behind an
+	// empty record. The typed refusal is what the operator acts on, so it is
+	// what is returned.
+	remedy := occupiedEmptyRemedy
+	if previous != "" {
+		remedy = occupiedRestoredRemedy
+	}
+	if err := s.refuseOccupied(ctx, target, remedy); err != nil {
+		if rbErr := s.rollback(ctx, rec, previous, target, nil, engine.Running{}, err); rbErr != nil {
+			return rbErr
+		}
+		// Both identities survive: it is a failed swap, and the thing the
+		// operator acts on is the occupied slot.
+		return fmt.Errorf("%w: %w", ErrSwapFailed, err)
 	}
 
 	s.printf("starting %s", target.Name)
@@ -184,7 +212,11 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 	}
 	running, err := drv.Start(ctx)
 	if err != nil {
-		return s.failUp(ctx, rec, previous, target, nil, engine.Running{}, fmt.Errorf("start: %w", err))
+		// Start failed after it may have created something (half a compose
+		// project, a container that will not come up). The driver is the only
+		// thing that knows how to take that back down, so it must be handed
+		// over rather than dropped for lack of a running handle.
+		return s.failUp(ctx, rec, previous, target, drv, engine.Running{}, fmt.Errorf("start: %w", err))
 	}
 	rec.Active = target.Name
 	rec.ActiveAt = time.Now()
@@ -218,7 +250,7 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 // healthAlreadyUp reports whether the target's HEALTH endpoint already
 // answers 2xx before cardo starts anything.
 func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) bool {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
 	defer cancel()
 	req, err := httpNewRequest(ctx, spec.Health)
 	if err != nil {
@@ -226,25 +258,49 @@ func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) bool
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// Nothing is listening: the slot is free, which is exactly what it
+		// looks like before cardo starts the engine that will answer it.
 		return false
 	}
-	resp.Body.Close()
-	return resp.StatusCode/100 == 2
+	defer resp.Body.Close()
+	// Any answer at all means somebody holds the port. A 404 from an nginx or
+	// a 503 from a half-dead upstream blocks the slot just as hard as a 200,
+	// and starting a second engine underneath it is the double-booking this
+	// guard exists to prevent; the status only says how alive they are.
+	return true
 }
+
+// The remedy in a refusal depends on what the operator can actually do about
+// it, which differs by where in the swap the guard fired.
+const (
+	// occupiedStaleRemedy applies where cardo never had a live handle: the
+	// record is the only thing naming a resident, and --forget is how a stale
+	// one is cleared.
+	occupiedStaleRemedy = "whatever holds it is not recorded as resident, so inspect it and clear the record with `cardo down --forget` if it is stale"
+	// occupiedRestoredRemedy applies where this swap stopped an engine and the
+	// rollback has just brought it back. Advising `down --forget` there would
+	// have the operator throw away the record of a live engine cardo does own.
+	occupiedRestoredRemedy = "the previous engine was restored as resident by this rollback, so there is nothing to forget: investigate what answers HEALTH there before anything else goes on the slot"
+	// occupiedEmptyRemedy applies where nothing was resident before the swap:
+	// there is no record to clear and nothing was restored.
+	occupiedEmptyRemedy = "nothing was resident before this swap, so there is no record to clear: investigate what answers HEALTH there before anything else goes on the slot"
+)
 
 // refuseOccupied turns "the HEALTH endpoint already answers" into the typed
 // refusal that stops a swap before a second engine is put on the same slot.
-func (s *Swapper) refuseOccupied(ctx context.Context, spec *config.Engine) error {
+func (s *Swapper) refuseOccupied(ctx context.Context, spec *config.Engine, remedy string) error {
 	if !s.healthAlreadyUp(ctx, spec) {
 		return nil
 	}
-	return fmt.Errorf("%w: something already answers HEALTH of %s, so cardo will not start a second engine on that slot; whatever holds it is not recorded as resident, so inspect it and clear the record with `cardo down --forget` if it is stale", ErrSlotOccupied, spec.Name)
+	return fmt.Errorf("%w: something already answers HEALTH of %s, so cardo will not start a second engine on that slot; %s", ErrSlotOccupied, spec.Name, remedy)
 }
 
-// failUp performs the rollback best effort on a detached context (a Ctrl-C
-// must not orphan the target or skip the restore) and wraps the cause.
-func (s *Swapper) failUp(ctx context.Context, rec *state.Record, previous string, target *config.Engine, drv engine.Engine, running engine.Running, cause error) error {
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupBudget)
+// rollback performs the best-effort undo of a failed `up` on a detached
+// context (a Ctrl-C must not orphan the target or skip the restore) and
+// returns nil when the previous engine is resident again. Any error it
+// returns already names `cause` and is the caller's answer.
+func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous string, target *config.Engine, drv engine.Engine, running engine.Running, cause error) error {
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cleanupBudgetFor(previous))
 	defer cancel()
 
 	if drv != nil {
@@ -301,7 +357,34 @@ func (s *Swapper) failUp(ctx context.Context, rec *state.Record, previous string
 	if err := s.State.Save(*rec); err != nil {
 		return err
 	}
+	return nil
+}
+
+// failUp performs the rollback and wraps the cause, for the failures where
+// "the swap failed" is the whole story.
+func (s *Swapper) failUp(ctx context.Context, rec *state.Record, previous string, target *config.Engine, drv engine.Engine, running engine.Running, cause error) error {
+	if err := s.rollback(ctx, rec, previous, target, drv, running, cause); err != nil {
+		return err
+	}
 	return fmt.Errorf("%w: %v", ErrSwapFailed, cause)
+}
+
+// cleanupBudgetFor is how long a detached cleanup may take when it has to
+// bring `previous` back up. The base budget covers an ordinary stop; a
+// rollback additionally has to wait out previous's own HEALTH, and the
+// shipped examples set WAIT=300, which a flat 2m would silently truncate and
+// then report a perfectly restorable engine as "rollback also failed".
+// Anything cardo cannot price (no previous, an engine that left the registry)
+// keeps the base budget.
+func (s *Swapper) cleanupBudgetFor(previous string) time.Duration {
+	if previous == "" {
+		return cleanupBudget
+	}
+	spec, ok := s.Registry.Get(previous)
+	if !ok || spec.Wait <= 0 {
+		return cleanupBudget
+	}
+	return cleanupBudget + time.Duration(spec.Wait)*time.Second + cleanupBudgetMargin
 }
 
 // bringUp starts an engine and waits for plain health, without hooks,
@@ -399,7 +482,7 @@ func (s *Swapper) retire(ctx context.Context, name string, pid int) error {
 		s.printf("warning: %s is not running; skipping drain and stop", name)
 		// The record diverged from reality, and whatever holds the slot is not
 		// what cardo started. Do not stack another engine on it.
-		return s.refuseOccupied(ctx, spec)
+		return s.refuseOccupied(ctx, spec, occupiedStaleRemedy)
 	}
 
 	if err := s.drain(ctx, spec); err != nil {

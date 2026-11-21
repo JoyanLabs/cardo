@@ -125,6 +125,9 @@ func Parse(r io.Reader, file string) (*Engine, error) {
 		return nil, err
 	}
 	kv := map[string]string{}
+	// asWritten keeps each value before comment stripping. It is what lets a
+	// probe tell "no value at all" from "a value the comment rule ate".
+	asWritten := map[string]string{}
 	order := []string{}
 	for i, line := range strings.Split(string(raw), "\n") {
 		n := i + 1
@@ -151,6 +154,7 @@ func Parse(r io.Reader, file string) (*Engine, error) {
 		// whitespace-preceded comment (ADR-0006).
 		val = parseValue(val)
 		kv[key] = val
+		asWritten[key] = strings.TrimSpace(line[eq+1:])
 		order = append(order, key)
 	}
 	e := &Engine{File: file, Drain: defaultDrain, Wait: defaultWait, Slot: 0}
@@ -179,12 +183,28 @@ func Parse(r io.Reader, file string) (*Engine, error) {
 	}
 	parseProbe := func(key string, dst **Probe) error {
 		v, ok := kv[key]
-		if !ok || v == "" {
+		if !ok {
+			return nil
+		}
+		if v == "" {
+			// Two very different lines end up here: `BUSY=` (the config says
+			// there is no probe, which is fine) and `BUSY=#$.count`, where the
+			// '#' that separates url from selector opens what the comment rule
+			// reads as a comment, so the whole value disappears. Dropping the
+			// second one silently is the dangerous outcome: an absent BUSY
+			// probe lets `cardo up` swap over an engine that is still serving
+			// requests. Only the text as written tells them apart.
+			if sel, bare := bareSelectorValue(asWritten[key]); bare {
+				return missingProbeURL(file, key, asWritten[key], sel)
+			}
 			return nil
 		}
 		u, sel, found := strings.Cut(v, "#")
 		if !found {
 			return &KeyError{File: file, Key: key, Reason: "missing #selector part"}
+		}
+		if strings.TrimSpace(u) == "" {
+			return missingProbeURL(file, key, v, sel)
 		}
 		s, err := ParseSelector(sel)
 		if err != nil {
@@ -200,6 +220,26 @@ func Parse(r io.Reader, file string) (*Engine, error) {
 		return nil, err
 	}
 	return e, nil
+}
+
+// bareSelectorValue reports whether a value as written is nothing but a
+// selector: an empty part before the '#'. An empty or absent value is not one
+// (that is "no probe"), and neither is a value with a URL in front.
+func bareSelectorValue(raw string) (string, bool) {
+	u, sel, found := strings.Cut(strings.TrimSpace(raw), "#")
+	if !found || strings.TrimSpace(u) != "" {
+		return "", false
+	}
+	return sel, true
+}
+
+// missingProbeURL is the rejection of a BUSY/PROGRESS value with no URL in
+// front of the selector. It names the URL that is missing rather than letting
+// the key quietly disappear from the parsed engine.
+func missingProbeURL(file, key, value, sel string) error {
+	return &KeyError{File: file, Key: key, Reason: fmt.Sprintf(
+		"missing URL before the '#': %q selects %q but says nothing to ask; write http://host:port/path#%s",
+		value, sel, sel)}
 }
 
 // ParseFile reads and parses the .conf file at path.

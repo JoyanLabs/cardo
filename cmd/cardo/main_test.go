@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -258,8 +260,10 @@ func foreignDecoy(t *testing.T, argv0, payload string) int {
 }
 
 // TestDownRefusesToStopAForeignProcess is the CLI half of the ownership
-// check: a pid that does not carry cardo's exact START is reported, not
-// killed, and the stale record is still cleared for the operator.
+// check, and since round 3 of the review the two outcomes are distinct: a
+// recorded pid that is a live process cardo cannot prove is its own is not
+// "already gone". The swap aborts loudly, the process is left running, and
+// the record stays for the operator to look at.
 func TestDownRefusesToStopAForeignProcess(t *testing.T) {
 	c := newCLI(t, map[string]string{"demo.conf": demoConf("97")})
 	const payload = "sleep 9077 & sleep 9077"
@@ -267,17 +271,228 @@ func TestDownRefusesToStopAForeignProcess(t *testing.T) {
 	c.writeState(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, pid))
 
 	code, out, errOut := capture(t, func() int { return run([]string{"down"}) })
-	if code != 0 {
-		t.Fatalf("down exit = %d, stdout=%q stderr=%q", code, out, errOut)
+	if code == 0 {
+		t.Fatalf("down over a live foreign pid must fail, stdout=%q stderr=%q", out, errOut)
 	}
 	if !pidAlive(pid) {
 		t.Errorf("`cardo down` killed a process it does not own (pid %d)", pid)
 	}
-	if !strings.Contains(errOut, "already gone") {
-		t.Errorf("cardo must say the recorded pid was not its engine: stdout=%q stderr=%q", out, errOut)
+	if strings.Contains(errOut, "already gone") {
+		t.Errorf("a live process must not be reported as gone, which is the proceedable outcome: %q", errOut)
 	}
-	if st := c.readState(); strings.Contains(st, `"active": "demo"`) {
-		t.Errorf("the stale record must still be cleared, got %s", st)
+	if !strings.Contains(errOut, "will not signal it") || !strings.Contains(errOut, fmt.Sprint(pid)) {
+		t.Errorf("cardo must say the recorded pid is alive but not its engine: stdout=%q stderr=%q", out, errOut)
+	}
+	if got := c.activeName(); got != "demo" {
+		t.Errorf("a down that could not stop the resident must leave the record for the operator, got %s", c.readState())
+	}
+
+	// The escape hatch is the only way out, and it still does not kill.
+	code, out, errOut = capture(t, func() int { return run([]string{"down", "--forget"}) })
+	if code != 0 {
+		t.Fatalf("down --forget must clear the record: exit=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	if got := c.activeName(); got != "" {
+		t.Errorf("the record must be cleared by --forget, got %s", c.readState())
+	}
+	if !pidAlive(pid) {
+		t.Errorf("--forget killed pid %d; it must leave a foreign process alone", pid)
+	}
+}
+
+// TestDownStopsADeadRecordedPIDWithoutComplaint is the other half of the
+// split the review asked for: a record whose pid is no longer a process at
+// all is the proceedable case. `down` warns, clears the record and succeeds.
+func TestDownStopsADeadRecordedPIDWithoutComplaint(t *testing.T) {
+	c := newCLI(t, map[string]string{"demo.conf": demoConf("96")})
+	// A pid that is not a process: `cardo up` wrote the record, something else
+	// reaped the engine, and the record is simply stale.
+	c.writeState(`{"version":1,"slot":0,"active":"demo","active_pid":99999999}`)
+
+	code, out, errOut := capture(t, func() int { return run([]string{"down"}) })
+	if code != 0 {
+		t.Fatalf("a stale record of a dead pid must not block down: exit=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	if got := c.activeName(); got != "" {
+		t.Errorf("the stale record must be cleared, got %s", c.readState())
+	}
+	if strings.Contains(errOut, "will not signal it") {
+		t.Errorf("nothing here belongs to somebody else: %q", errOut)
+	}
+	_ = out
+}
+
+// gatedHealth answers on a port that refuses connections until running() says
+// something is home. cardo's divergence guard now reads any HTTP answer,
+// including an error status, as an occupant, so an end-to-end `up` test has
+// to look like a cold port that the engine itself warms up.
+func gatedHealth(t *testing.T, running func() bool) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Listener = &gateListener{Listener: ln, open: running}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+type gateListener struct {
+	net.Listener
+	open func() bool
+}
+
+func (g *gateListener) Accept() (net.Conn, error) {
+	for {
+		c, err := g.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if g.open == nil || g.open() {
+			return c, nil
+		}
+		c.Close() // nobody home: the client sees a transport failure
+	}
+}
+
+// processRunningWith reports whether some live process carries want in its
+// command line (argv is \0-separated in /proc, so it is joined to compare).
+func processRunningWith(want string) bool {
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		argv := strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00")
+		if strings.Contains(strings.Join(argv, " "), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// activeName reads the engine cardo records as resident ("" when nothing is).
+func (c *cli) activeName() string {
+	c.t.Helper()
+	var rec struct {
+		Active string `json:"active"`
+	}
+	_ = json.Unmarshal([]byte(c.readState()), &rec)
+	return rec.Active
+}
+
+// residentPID reads the pid cardo recorded as resident.
+func (c *cli) residentPID() int {
+	c.t.Helper()
+	var rec struct {
+		ActivePID int `json:"active_pid"`
+	}
+	if err := json.Unmarshal([]byte(c.readState()), &rec); err != nil {
+		c.t.Fatalf("state is not readable: %v (%s)", err, c.readState())
+	}
+	if rec.ActivePID <= 0 {
+		c.t.Fatalf("state records no pid: %s", c.readState())
+	}
+	return rec.ActivePID
+}
+
+// commandConf is a command engine whose HEALTH only answers once a process
+// carrying payload is running, which is the honest shape of "cardo starts it".
+func commandConf(name, start, payload string, wait int) string {
+	return "NAME=" + name + "\nTYPE=command\nSTART=" + start + "\n" +
+		"HEALTH=__HEALTH__\nDRAIN=0\nWAIT=" + fmt.Sprint(wait) + "\nSLOT=0\n"
+}
+
+// TestUpDownStopsAnExecPrefixedEngine is smoke (a) of the ownership review,
+// end to end: START="exec sleep N" is the documented way to keep a command
+// engine in the foreground, and dash then replaces the shell image, so
+// /proc shows `sleep N` rather than `sh -c exec sleep N`. `cardo up` must
+// bring it up and `cardo down` must still recognise its own engine and stop
+// it, rather than calling it gone and leaving it running.
+func TestUpDownStopsAnExecPrefixedEngine(t *testing.T) {
+	const start = "exec sleep 9341"
+	c := newCLI(t, map[string]string{"demo.conf": strings.Replace(
+		commandConf("demo", start, "sleep 9341", 10), "__HEALTH__", gatedHealth(t, func() bool {
+			return processRunningWith("sleep 9341")
+		}), 1)})
+
+	code, out, errOut := capture(t, func() int { return run([]string{"up", "demo"}) })
+	if code != 0 {
+		t.Fatalf("up must bring up an exec-prefixed engine: exit=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	pid := c.residentPID()
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+	if !pidAlive(pid) {
+		t.Fatalf("engine %d is not running after up", pid)
+	}
+
+	code, out, errOut = capture(t, func() int { return run([]string{"down"}) })
+	if code != 0 {
+		t.Fatalf("down exit = %d, stdout=%q stderr=%q", code, out, errOut)
+	}
+	if !waitForPIDDead(pid, 5*time.Second) {
+		t.Errorf("pid %d survived `cardo down`: an exec-prefixed START must still prove ownership", pid)
+	}
+	if got := c.activeName(); got != "" {
+		t.Errorf("the record must be cleared after a clean down, got %s", c.readState())
+	}
+}
+
+// TestDownRefusesAnEditedExecPrefixedStart is smoke (b): the record was
+// written when START was `exec sleep 9343`, and the config has since been
+// edited to a different payload. The live process is no longer provably
+// cardo's, so `down` must refuse, leave it running, and keep the record;
+// --forget remains the operator's way out.
+func TestDownRefusesAnEditedExecPrefixedStart(t *testing.T) {
+	c := newCLI(t, map[string]string{"demo.conf": strings.Replace(
+		commandConf("demo", "exec sleep 9343", "sleep 9343", 10), "__HEALTH__", gatedHealth(t, func() bool {
+			return processRunningWith("sleep 9343")
+		}), 1)})
+
+	code, out, errOut := capture(t, func() int { return run([]string{"up", "demo"}) })
+	if code != 0 {
+		t.Fatalf("up failed: exit=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	pid := c.residentPID()
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) })
+
+	// The operator edits START after the engine came up.
+	body := strings.Replace(commandConf("demo", "exec sleep 9344", "sleep 9344", 10), "__HEALTH__", "http://127.0.0.1:1/health", 1)
+	if err := os.WriteFile(filepath.Join(c.confDir, "demo.conf"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errOut = capture(t, func() int { return run([]string{"down"}) })
+	if code == 0 {
+		t.Fatalf("down must refuse a payload its START no longer describes: stdout=%q stderr=%q", out, errOut)
+	}
+	if !pidAlive(pid) {
+		t.Errorf("cardo killed pid %d on an ownership proof it could not make", pid)
+	}
+	if !strings.Contains(errOut, "will not signal it") {
+		t.Errorf("the refusal must say why it will not touch the pid: %q", errOut)
+	}
+	if got := c.activeName(); got != "demo" {
+		t.Errorf("the record of the live engine must survive the refusal, got %s", c.readState())
+	}
+
+	code, out, errOut = capture(t, func() int { return run([]string{"down", "--forget"}) })
+	if code != 0 {
+		t.Fatalf("--forget must still work: exit=%d stdout=%q stderr=%q", code, out, errOut)
+	}
+	if !pidAlive(pid) {
+		t.Errorf("--forget must not kill anything (pid %d)", pid)
 	}
 }
 
@@ -324,10 +539,19 @@ func TestUpRefusesWhenTheSlotAlreadyAnswers(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("`up` over an occupied slot must fail, stdout=%q stderr=%q", out, errOut)
 	}
-	for _, want := range []string{"already answers HEALTH of demo", "down --forget"} {
+	for _, want := range []string{"already answers HEALTH of demo", "investigate what answers HEALTH"} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("stderr must contain %q, got %q", want, errOut)
 		}
+	}
+	// Nothing was resident before this swap and nothing was restored, so the
+	// record is empty: telling the operator to `down --forget` an empty record
+	// sends them chasing a thing that is not there.
+	if strings.Contains(errOut, "down --forget") {
+		t.Errorf("there is no record to forget here, got %q", errOut)
+	}
+	if strings.Contains(errOut, "was restored") {
+		t.Errorf("nothing was restored (nothing had been stopped): %q", errOut)
 	}
 	if st := c.readState(); strings.Contains(st, `"active": "demo"`) {
 		t.Errorf("cardo must not claim an engine it never started, got %s", st)

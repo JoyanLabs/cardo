@@ -346,3 +346,86 @@ func TestSelectorGrammar(t *testing.T) {
 		}
 	}
 }
+
+// probeBody is a valid engine with only the probe line varying.
+func probeBody(line string) string {
+	return "NAME=\"p\"\nTYPE=\"docker\"\nCONTAINER=\"c\"\nHEALTH=\"http://127.0.0.1:8080/health\"\n" + line + "\n"
+}
+
+// TestParseProbeWithoutURLIsAKeyError pins F6: a BUSY/PROGRESS value that is
+// only a selector must be reported, never quietly dropped. A value starting
+// with '#' is what an operator writes when they mean "same URL as HEALTH",
+// and an unquoted one is eaten whole by the comment rule: the key vanishes,
+// and a missing BUSY probe means `cardo up` swaps over an engine that is
+// still serving requests.
+func TestParseProbeWithoutURLIsAKeyError(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		key  string
+		want string
+	}{
+		{"busy unquoted", `BUSY=#$.count`, "BUSY", "#$.count"},
+		{"busy quoted", `BUSY="#$.count"`, "BUSY", "#$.count"},
+		{"busy bare hash", `BUSY=#`, "BUSY", "#"},
+		{"progress unquoted", `PROGRESS=#$.pct`, "PROGRESS", "#$.pct"},
+		{"progress quoted", `PROGRESS="#$.pct"`, "PROGRESS", "#$.pct"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, err := ParseFile(write(t, dir, "p.conf", probeBody(c.line)))
+			if err == nil {
+				t.Fatalf("%s: a probe value with no URL must be an error, not a parsed engine", c.key)
+			}
+			var ke *KeyError
+			if !errors.As(err, &ke) {
+				t.Fatalf("%s: want a *KeyError, got %T: %v", c.key, err, err)
+			}
+			if ke.Key != c.key {
+				t.Errorf("the KeyError names %q, want %q", ke.Key, c.key)
+			}
+			if !strings.Contains(ke.Reason, "missing URL") {
+				t.Errorf("the reason must name the missing URL, got %q", ke.Reason)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the error must quote the offending value %q: %v", c.want, err)
+			}
+		})
+	}
+}
+
+// TestParseProbeEmptyValueStillMeansNoProbe is the PRESERVE half: an empty
+// value is how a config says "no BUSY probe at all", and that has to keep
+// working rather than becoming the same error as a selector with no URL.
+func TestParseProbeEmptyValueStillMeansNoProbe(t *testing.T) {
+	dir := t.TempDir()
+	e, err := ParseFile(write(t, dir, "p.conf", probeBody("BUSY=\nPROGRESS=\"\"")))
+	if err != nil {
+		t.Fatalf("an empty probe value still means \"no probe\": %v", err)
+	}
+	if e.Busy != nil || e.Progress != nil {
+		t.Errorf("empty values must leave no probe: busy=%v progress=%v", e.Busy, e.Progress)
+	}
+}
+
+// TestParseProbeExistingRejectionsAndAcceptsSurvive is the other PRESERVE
+// half: the pre-existing "no # at all" rejection, and a well-formed unquoted
+// value whose glued '#' is the url#selector separator and whose
+// whitespace-preceded '#' is a comment.
+func TestParseProbeExistingRejectionsAndAcceptsSurvive(t *testing.T) {
+	dir := t.TempDir()
+	_, err := ParseFile(write(t, dir, "a.conf", probeBody(`BUSY=http://127.0.0.1:8080/metrics`)))
+	if err == nil || !strings.Contains(err.Error(), "missing #selector part") {
+		t.Errorf("a value with no selector must still say so, got %v", err)
+	}
+
+	dir = t.TempDir()
+	e, err := ParseFile(write(t, dir, "b.conf", probeBody(`BUSY=http://127.0.0.1:8080/metrics#$.queue.pending.length   # live jobs`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Busy == nil || e.Busy.URL != "http://127.0.0.1:8080/metrics" || e.Busy.Selector.String() != "$.queue.pending.length" {
+		t.Errorf("a glued '#' is the url#selector separator, not a comment: %+v", e.Busy)
+	}
+}

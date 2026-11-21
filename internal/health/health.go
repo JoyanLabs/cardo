@@ -36,6 +36,14 @@ var ErrBroken = errors.New("engine broken")
 // only a sustained run of them is evidence the process or container exited.
 const deadVerdicts = 3
 
+// deadWindow is how long a run of dead verdicts must already have been going
+// on before it is treated as an exited process. Counting verdicts alone is
+// not enough: a liveness check that is merely flaky can hand over three
+// "dead" answers inside a few hundred milliseconds, while an engine that
+// really exited stays dead for as long as anyone looks. A variable so tests
+// can shrink it.
+var deadWindow = 5 * time.Second
+
 // maxPoll bounds the probe cadence; it is clamped against the stall window
 // so a short WAIT still polls fast enough to notice progress.
 const maxPoll = 1 * time.Second
@@ -56,7 +64,9 @@ func pollInterval(stall time.Duration) time.Duration {
 // deadline on observable progress. progress is the optional PROGRESS probe
 // (ADR-0005, passed parsed so the selector cannot be mangled); alive reports
 // whether the engine process/container is still alive. alive answering dead
-// deadVerdicts times in a row is ErrBroken (one flaky verdict is not).
+// deadVerdicts times in a row, over at least deadWindow of wall time, is
+// ErrBroken (a short run of flaky verdicts is not). The last transport
+// failure is carried into both ErrStalled and ErrBroken.
 func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() bool, stall time.Duration) error {
 	deadline := time.Now().Add(stall)
 	cadence := pollInterval(stall)
@@ -64,22 +74,32 @@ func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive fu
 	var lastProgress *float64
 	lastCode := -1 // no answer yet
 	dead := 0      // consecutive dead liveness verdicts
+	var firstDead time.Time
+	// lastFetchErr is the most recent transport-level failure. It is kept
+	// because "health stalled" on its own cannot tell an engine that never
+	// bound its port from one whose handler is wedged, and that is exactly
+	// what the operator needs to know to go looking.
+	var lastFetchErr error
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for {
 		if !alive() {
+			if dead == 0 {
+				firstDead = time.Now()
+			}
 			dead++
-			if dead >= deadVerdicts {
-				return fmt.Errorf("%w: engine process or container exited while loading", ErrBroken)
+			if dead >= deadVerdicts && time.Since(firstDead) >= deadWindow {
+				return fmt.Errorf("%w: engine process or container exited while loading%s", ErrBroken, fetchErrSuffix(lastFetchErr))
 			}
 		} else {
 			dead = 0
+			firstDead = time.Time{}
 		}
 		if time.Now().After(deadline) {
 			if lastProgress != nil {
-				return fmt.Errorf("%w after %s (last progress %v)", ErrStalled, stall, *lastProgress)
+				return fmt.Errorf("%w after %s (last progress %v)%s", ErrStalled, stall, *lastProgress, fetchErrSuffix(lastFetchErr))
 			}
-			return fmt.Errorf("%w after %s", ErrStalled, stall)
+			return fmt.Errorf("%w after %s%s", ErrStalled, stall, fetchErrSuffix(lastFetchErr))
 		}
 
 		if !portSeen {
@@ -94,7 +114,9 @@ func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive fu
 		}
 
 		code, body, err := fetch(ctx, client, healthURL)
-		if err == nil {
+		if err != nil {
+			lastFetchErr = err
+		} else {
 			if code/100 == 2 {
 				return nil
 			}
@@ -129,10 +151,21 @@ func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive fu
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %v", ErrBroken, ctx.Err())
+			return fmt.Errorf("%w: %v%s", ErrBroken, ctx.Err(), fetchErrSuffix(lastFetchErr))
 		case <-time.After(cadence):
 		}
 	}
+}
+
+// fetchErrSuffix carries the reason the endpoint could not be reached into
+// the failure the operator reads. An engine whose health never answered is
+// reported differently depending on whether the port refused connections, the
+// dial timed out, or the body never arrived.
+func fetchErrSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf(" (last health fetch failed: %v)", err)
 }
 
 // fetch GETs the health URL; any HTTP answer (even non-200) is not an error.

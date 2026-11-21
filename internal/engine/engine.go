@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,8 +21,16 @@ import (
 
 // ErrGone means the engine cardo was asked to stop no longer exists
 // (container removed, process exited). Callers treat it as stopped, with a
-// warning: it is never an untracked-kill order.
+// warning: it is never an untracked-kill order, and a swap may proceed.
 var ErrGone = errors.New("engine is gone")
+
+// ErrNotOurs means a recorded pid is a live process whose command line does
+// not prove it belongs to this engine: somebody else's process holds the slot.
+// It is deliberately NOT ErrGone. The two outcomes of an unverifiable record
+// are opposite: a record whose pid is no process at all is proceedable (the
+// slot really is free), while a live unowned pid means the slot is busy, so
+// the caller must abort rather than warn and start a second engine on it.
+var ErrNotOurs = errors.New("recorded pid is alive but does not match this engine's START")
 
 // Running is the handle a Start returns: whichever identifier applies.
 type Running struct {
@@ -228,15 +237,18 @@ func (c *commandEngine) Stop(ctx context.Context, running Running, grace time.Du
 	c.mu.Unlock()
 
 	if cmd == nil || cmd.Process.Pid != pid {
-		// A recorded PID from an earlier run: it is ours only if it still
-		// carries the exact `sh -c <START>` cardo launches (ADR-0004
-		// ownership check). Anything else is a foreign process: ErrGone,
-		// never a signal.
-		if !looksLikeEngine(pid, c.spec.Start) {
-			return fmt.Errorf("%w: recorded pid %d does not match engine %s", ErrGone, pid, c.spec.Name)
-		}
+		// A recorded PID from an earlier run. Its two failure modes mean
+		// opposite things to the caller (ADR-0004 ownership check), so they
+		// get two distinct outcomes: nothing there at all is ErrGone and the
+		// swap may proceed; a live process cardo cannot prove is its own is
+		// ErrNotOurs, which must abort the swap. Either way it is never a
+		// signal.
 		if !processAlive(pid) {
-			return nil
+			return fmt.Errorf("%w: recorded pid %d of engine %s is no longer a process", ErrGone, pid, c.spec.Name)
+		}
+		if !looksLikeEngine(pid, c.spec.Start) {
+			return fmt.Errorf("%w: pid %d is alive but its command line is not `sh -c %s`, so cardo will not signal it (engine %s)",
+				ErrNotOurs, pid, c.spec.Start, c.spec.Name)
 		}
 		return stopGroup(pid, grace)
 	}
@@ -313,16 +325,8 @@ func processAlive(pid int) bool {
 	return !strings.HasPrefix(rest, "Z")
 }
 
-// looksLikeEngine verifies a recorded PID before cardo signals it. cardo
-// starts command engines as `sh -c <START>` (see commandEngine.Start), so the
-// process is ours only while its command line is still exactly that: argv[0]
-// a shell, argv[1] the -c flag, and argv[2] this engine's own START.
-//
-// Nothing weaker is safe. The previous rules (argv[0] ending in "sh", or the
-// cmdline merely containing START's first token) matched a foreign
-// `fish -c ...` that happened to mention the same word, and `cardo down`
-// killed it. A pid that does not carry our exact START is not ours: report
-// ErrGone and leave it running.
+// looksLikeEngine verifies a recorded PID before cardo signals it, reading
+// the command line the kernel reports for it.
 func looksLikeEngine(pid int, start string) bool {
 	if start == "" {
 		return false
@@ -331,9 +335,61 @@ func looksLikeEngine(pid int, start string) bool {
 	if err != nil || len(b) == 0 {
 		return false
 	}
-	argv := strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00")
-	if len(argv) < 3 {
+	return provesOwnership(strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00"), start)
+}
+
+// provesOwnership is the whole ownership rule, as a pure function of argv and
+// START so every shape is testable (a shell that has exec'd its payload is
+// gone again before any test could look at it).
+//
+// cardo starts command engines as `sh -c <START>` (see commandEngine.Start),
+// so the process is ours only if its command line is one of exactly two
+// things:
+//
+//  1. argv[0] whose last path element is "sh" (NOT "fish", NOT "bash": the
+//     old suffix match killed a foreign `fish -c ...`), argv[1] == "-c", and
+//     argv[2] this engine's own START — or that START with a leading `exec `
+//     (a shell that was handed the payload exec-prefixed and has not replaced
+//     itself yet);
+//  2. the payload of a START that begins with `exec `, which is what dash
+//     leaves behind when it replaces the shell image in place: `/proc` then
+//     shows the program itself (`sleep 297`), not the shell. An exec'd image
+//     is only ever provable for a START that asked for exec, so a plain START
+//     can never claim a non-shell process.
+//
+// Anything else is somebody else's process and is left running. A payload
+// whose quoting the shell had to reshape (it arrives as fewer argv words than
+// Fields produces) is not provable either: cardo refuses rather than guessing
+// at a kill, and `cardo down --forget` remains the escape hatch.
+func provesOwnership(argv []string, start string) bool {
+	if start == "" || len(argv) == 0 {
 		return false
 	}
-	return strings.HasSuffix(argv[0], "sh") && argv[1] == "-c" && argv[2] == start
+	if len(argv) >= 3 && path.Base(argv[0]) == "sh" && argv[1] == "-c" {
+		return argv[2] == start || argv[2] == "exec "+start
+	}
+	payload, ok := execPayload(start)
+	if !ok {
+		return false
+	}
+	if len(argv) != len(payload) || path.Base(argv[0]) != path.Base(payload[0]) {
+		return false
+	}
+	for i := 1; i < len(argv); i++ {
+		if argv[i] != payload[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// execPayload splits the payload of a START whose first word is the `exec`
+// builtin, the shape that lets a command engine run in the foreground without
+// a shell parent holding the process group.
+func execPayload(start string) ([]string, bool) {
+	fields := strings.Fields(start)
+	if len(fields) < 2 || fields[0] != "exec" {
+		return nil, false
+	}
+	return fields[1:], true
 }

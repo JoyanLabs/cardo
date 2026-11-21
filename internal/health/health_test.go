@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -337,6 +338,10 @@ func TestWaitToleratesOneTransientDeadVerdict(t *testing.T) {
 // a run of consecutive dead verdicts is still ErrBroken, and it must take the
 // whole run (one verdict alone must not condemn the engine).
 func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
+	restore := deadWindow
+	deadWindow = 300 * time.Millisecond
+	t.Cleanup(func() { deadWindow = restore })
+
 	const stall = 2 * time.Second
 	srv, _ := rampServer(t, 1000) // never reaches health within the test
 	var verdicts atomic.Int64
@@ -352,6 +357,10 @@ func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
 }
 
 func TestWaitDeadEngineIsBroken(t *testing.T) {
+	restore := deadWindow
+	deadWindow = 100 * time.Millisecond
+	t.Cleanup(func() { deadWindow = restore })
+
 	alive := func() bool { return false }
 	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, alive, time.Second)
 	if !errors.Is(err, ErrBroken) {
@@ -360,6 +369,10 @@ func TestWaitDeadEngineIsBroken(t *testing.T) {
 }
 
 func TestWaitDeadEngineAfterProgressIsBroken(t *testing.T) {
+	restore := deadWindow
+	deadWindow = 100 * time.Millisecond
+	t.Cleanup(func() { deadWindow = restore })
+
 	// The engine made progress, then died: broken, not stalled.
 	changes := 0
 	srv := stallServer(t, func() (float64, bool) {
@@ -387,5 +400,96 @@ func TestWaitProbeFailureNeverSucceeds(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 4*stall {
 		t.Errorf("waited %v on a probe that can never answer", elapsed)
+	}
+}
+
+// TestWaitStalledNamesTheLastFetchFailure pins F7: "health stalled" alone
+// tells an operator nothing about why. The last fetch error (connection
+// refused, a wedged dial, a truncated body) is the difference between an
+// engine that never bound its port and one whose endpoint is wedged, so it
+// has to survive into the message.
+func TestWaitStalledNamesTheLastFetchFailure(t *testing.T) {
+	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() bool { return true }, 120*time.Millisecond)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("want ErrStalled, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("the stall message must carry the last fetch error, got %q", err)
+	}
+}
+
+// TestWaitBrokenNamesTheLastFetchFailure: the same for ErrBroken, where the
+// operator's next question is whether the process died or the endpoint did.
+func TestWaitBrokenNamesTheLastFetchFailure(t *testing.T) {
+	restore := deadWindow
+	deadWindow = 50 * time.Millisecond
+	t.Cleanup(func() { deadWindow = restore })
+
+	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() bool { return false }, time.Second)
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("want ErrBroken, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("the broken message must carry the last fetch error, got %q", err)
+	}
+}
+
+// TestWaitDeadVerdictsMustSpanTheDeadWindow pins the wall-clock half of the
+// dead rule: three dead verdicts are not enough on their own, they must also
+// span the window, so a burst of flaky liveness answers cannot condemn an
+// engine that is still loading. The endpoint alternates status codes, which
+// counts as progress and keeps the stall timeout out of the decision.
+func TestWaitDeadVerdictsMustSpanTheDeadWindow(t *testing.T) {
+	restore := deadWindow
+	deadWindow = 1 * time.Second
+	t.Cleanup(func() { deadWindow = restore })
+
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1)%2 == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+
+	start := time.Now()
+	err := Wait(context.Background(), srv.URL, nil, func() bool { return false }, 200*time.Millisecond)
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("a sustained dead verdict must still be ErrBroken, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < deadWindow {
+		t.Errorf("ErrBroken after %v, shorter than the %v dead window it must span", elapsed, deadWindow)
+	}
+}
+
+// TestWaitShortDeadRunStallsInsteadOfBreaking is the same rule from the other
+// side: with a dead window nothing inside the test can span, a run of dead
+// verdicts is treated as a flaky inspector and the wait reports the stall.
+func TestWaitShortDeadRunStallsInsteadOfBreaking(t *testing.T) {
+	restore := deadWindow
+	deadWindow = time.Hour
+	t.Cleanup(func() { deadWindow = restore })
+
+	srv := stallServer(t, func() (float64, bool) { return 0, false }) // never healthy, never progressing
+	var verdicts atomic.Int64
+	err := Wait(context.Background(), srv.URL, nil, func() bool { verdicts.Add(1); return false }, 300*time.Millisecond)
+	if !errors.Is(err, ErrStalled) {
+		t.Fatalf("a dead run shorter than the window must stall, not break: %v", err)
+	}
+	if got := verdicts.Load(); got < 3 {
+		t.Errorf("the wait gave up after %d liveness verdicts, before a run of %d", got, deadVerdicts)
+	}
+}
+
+// TestDeadVerdictRulesAreTheDocumentedOnes pins the production values: three
+// consecutive dead verdicts, over at least five seconds of wall time.
+func TestDeadVerdictRulesAreTheDocumentedOnes(t *testing.T) {
+	if deadVerdicts < 3 {
+		t.Errorf("deadVerdicts = %d, want at least 3 (one flaky verdict must not condemn an engine)", deadVerdicts)
+	}
+	if deadWindow < 5*time.Second {
+		t.Errorf("deadWindow = %v, want at least 5s of dead verdicts before ErrBroken", deadWindow)
 	}
 }
