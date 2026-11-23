@@ -24,6 +24,11 @@ import (
 	"github.com/JoyanLabs/cardo/internal/state"
 )
 
+// ErrLivenessUnknown means the engine driver could not answer whether its
+// engine is running (wedged docker daemon, missing binary). The swap aborts:
+// a driver that cannot see must never be read as a dead engine.
+var ErrLivenessUnknown = errors.New("cannot verify engine liveness")
+
 // ErrSwapFailed wraps every failed `up`: the cause names the stage
 // (drain, hook, start, health) and rollback has already been attempted.
 var ErrSwapFailed = errors.New("swap failed")
@@ -249,6 +254,10 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 	rec.Active = target.Name
 	rec.ActiveAt = time.Now()
 	rec.ActivePID = running.PID
+	// The record's slot always names where the resident actually lives; a
+	// stale value turned the cross-slot guard into a permanent refusal of
+	// legitimate swaps (judgment-day round 5).
+	rec.Slot = target.Slot
 	if err := s.State.Save(*rec); err != nil {
 		// An engine that is running but not recorded as resident is invisible
 		// to every later `status` and `down`, so no cardo run can stop it
@@ -264,10 +273,19 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 	}
 
 	s.printf("waiting for health of %s (stall timeout %ds)", target.Name, target.Wait)
-	err = health.Wait(ctx, target.Health, progressProbe(target),
-		func() bool { return s.alive(ctx, target, running).running },
+	// A liveness verdict the driver could not produce is not "exited":
+	// reading a wedged docker daemon as a dead engine kills healthy loads
+	// mid-swap (judgment-day round 5). Abort instead.
+	if err := s.aliveOnce(ctx, target, running); err != nil {
+		return s.failUp(ctx, rec, previous, target, drv, running, fmt.Errorf("liveness: %w", err))
+	}
+	liveness := func() (bool, error) { ans := s.alive(ctx, target, running); return ans.running, ans.err }
+	err = health.Wait(ctx, target.Health, progressProbe(target), liveness,
 		time.Duration(target.Wait)*time.Second)
 	if err != nil {
+		if errors.Is(err, health.ErrLivenessUnknownWrap) {
+			return s.failUp(ctx, rec, previous, target, drv, running, fmt.Errorf("%w: %v", ErrLivenessUnknown, err))
+		}
 		return s.failUp(ctx, rec, previous, target, drv, running, fmt.Errorf("health: %w", err))
 	}
 
@@ -283,9 +301,9 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 type occupancyAsk int
 
 const (
-	occupiedNo occupancyAsk = iota // refused connection: the slot is free
-	occupiedYes                     // any HTTP answer holds the port
-	occupiedUnknown                 // timeout or other error: fail closed
+	occupiedNo      occupancyAsk = iota // refused connection: the slot is free
+	occupiedYes                         // any HTTP answer holds the port
+	occupiedUnknown                     // timeout or other error: fail closed
 )
 
 func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) (occupancyAsk, error) {
@@ -388,16 +406,20 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 	rec.ActivePID = 0
 	rec.ActiveAt = time.Time{}
 	var rrunning engine.Running
+	var rerr error
 	if previous != "" {
 		s.printf("rolling back to %s", previous)
 		prevSpec, haveSpec := s.Registry.Get(previous)
-		rrunning, rerr := s.bringUp(cleanup, previous)
+		// `=`, not `:=`: the outer rrunning is the rollback's ownership claim
+		// read by the save-failure guard below; a shadowed copy here made that
+		// guard dead code (judgment-day round 5).
+		rrunning, rerr = s.bringUp(cleanup, previous)
 		if rerr != nil {
 			// A rollback target that is running but unverified is still a live
 			// process cardo has just started. A record that says nothing is
 			// resident makes it unkillable by any later `cardo down`, so the
 			// ownership stays recorded and the failure is said out loud.
-			if rrunning.PID > 0 && haveSpec {
+			if haveSpec && s.rollbackHandleAlive(cleanup, prevSpec, rrunning) {
 				if ans := s.alive(cleanup, prevSpec, rrunning); ans.running {
 					rec.Active = previous
 					rec.ActiveAt = time.Now()
@@ -410,7 +432,7 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 			}
 			// It died or never came up: nothing of it may be left behind, and
 			// the record must not name a process that is not there.
-			if rrunning.PID > 0 && haveSpec {
+			if haveSpec {
 				if prevDrv, derr := s.driver(prevSpec); derr == nil {
 					if serr := prevDrv.Stop(cleanup, rrunning, 10*time.Second); serr != nil && !errors.Is(serr, engine.ErrGone) {
 						s.printf("warning: could not stop unverified rollback %s (pid %d): %v", previous, rrunning.PID, serr)
@@ -426,17 +448,20 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 		}
 		rec.Active = previous
 		rec.ActiveAt = time.Now()
-		rec.ActivePID = rrunning.PID
+		if rrunning.PID > 0 {
+			rec.ActivePID = rrunning.PID
+		}
+		rec.Slot = prevSpec.Slot
 	}
 	if serr := s.State.Save(*rec); serr != nil {
 		// B#2: the restored engine is running but the record says nothing is
 		// resident — the exact orphan the record exists to prevent. The safe
 		// default is to stop what we just restored and report the whole
 		// story; the next `up` starts clean.
-		if previous != "" && rrunning.PID > 0 {
+		if previous != "" {
 			if prevSpec, haveSpec := s.Registry.Get(previous); haveSpec {
 				if prevDrv, derr := s.driver(prevSpec); derr == nil {
-					if serr2 := prevDrv.Stop(cleanup, rrunning, 10*time.Second); serr2 != nil {
+					if serr2 := prevDrv.Stop(cleanup, rrunning, 10*time.Second); serr2 != nil && !errors.Is(serr2, engine.ErrGone) {
 						return fmt.Errorf("%w: %v; the restored %s (pid %d) could not be stopped after the record save failed (%v, then %v) and is running unrecorded", ErrSwapFailed, cause, previous, rrunning.PID, serr, serr2)
 					}
 				}
@@ -445,6 +470,22 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 		return fmt.Errorf("%w: %v; the record could not be saved after rollback (%v), so nothing is resident", ErrSwapFailed, cause, serr)
 	}
 	return nil
+}
+
+// rollbackHandleAlive asks whether a rollback handle is still alive; for a
+// command engine that means PID via /proc, for docker/compose the Running
+// handle is feedback the driver itself produced, so trust it when its PID
+// is unset (docker/compose always report healthy liveness through their
+// own drivers, so an unknown handle is treated as alive only if the driver
+// confirms it).
+func (s *Swapper) rollbackHandleAlive(ctx context.Context, spec *config.Engine, running engine.Running) bool {
+	ans := s.alive(ctx, spec, running)
+	if ans.err != nil {
+		// Cannot verify: conservatively treat as alive and record it — the
+		// record is the only path back to this handle.
+		return true
+	}
+	return ans.running || (running.PID <= 0 && running.Container != "")
 }
 
 // failUp performs the rollback and wraps the cause, for the failures where
@@ -489,12 +530,29 @@ func (s *Swapper) bringUp(ctx context.Context, name string) (engine.Running, err
 	if err != nil {
 		return engine.Running{}, err
 	}
-	if err := health.Wait(ctx, spec.Health, progressProbe(spec),
-		func() bool { return s.alive(ctx, spec, running).running },
+	if err := s.aliveOnce(ctx, spec, running); err != nil {
+		return engine.Running{}, err
+	}
+	liveness := func() (bool, error) { ans := s.alive(ctx, spec, running); return ans.running, ans.err }
+	if err := health.Wait(ctx, spec.Health, progressProbe(spec), liveness,
 		time.Duration(spec.Wait)*time.Second); err != nil {
+		if errors.Is(err, health.ErrLivenessUnknownWrap) {
+			return running, fmt.Errorf("%w: %v", ErrLivenessUnknown, err)
+		}
 		return running, err
 	}
 	return running, nil
+}
+
+// aliveOnce makes one liveness check and turns a driver failure into an
+// immediate typed abort (ErrLivenessUnknown): only a confident answer may
+// influence the swap.
+func (s *Swapper) aliveOnce(ctx context.Context, spec *config.Engine, running engine.Running) error {
+	ans := s.alive(ctx, spec, running)
+	if ans.err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrLivenessUnknown, spec.Name, ans.err)
+	}
+	return nil
 }
 
 // Down stops the resident engine, draining first. forget=true skips the

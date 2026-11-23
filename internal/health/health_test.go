@@ -45,7 +45,7 @@ func TestWaitHealthyImmediately(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	alive := func() bool { return true }
+	alive := func() (bool, error) { return true, nil }
 	start := time.Now()
 	if err := Wait(context.Background(), srv.URL, nil, alive, 500*time.Millisecond); err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestWaitAccepts2xxNotOnly200(t *testing.T) {
 				w.WriteHeader(code)
 			}))
 			defer srv.Close()
-			if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, 300*time.Millisecond); err != nil {
+			if err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return true, nil }, 300*time.Millisecond); err != nil {
 				t.Errorf("%d must count as healthy: %v", code, err)
 			}
 		})
@@ -74,7 +74,7 @@ func TestWaitAccepts2xxNotOnly200(t *testing.T) {
 		w.WriteHeader(http.StatusPermanentRedirect)
 	}))
 	defer srv.Close()
-	if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, 120*time.Millisecond); !errors.Is(err, ErrStalled) {
+	if err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return true, nil }, 120*time.Millisecond); !errors.Is(err, ErrStalled) {
 		t.Errorf("3xx must not count as healthy: %v", err)
 	}
 }
@@ -94,7 +94,7 @@ func TestWaitProgressChangeExtendsDeadline(t *testing.T) {
 		fmt.Fprintf(w, `{"progress":%v}`, float64(changes)/10)
 	}))
 	defer srv.Close()
-	alive := func() bool { return true }
+	alive := func() (bool, error) { return true, nil }
 
 	start := time.Now()
 	if err := Wait(context.Background(), srv.URL, nil, alive, 150*time.Millisecond); err != nil {
@@ -127,7 +127,7 @@ func TestWaitStatusChangeExtendsDeadline(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	if err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall); err != nil {
+	if err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return true, nil }, stall); err != nil {
 		t.Fatalf("changing statuses must extend the deadline: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < stall {
@@ -148,7 +148,7 @@ func TestWaitIdenticalStatusForeverStalls(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall)
+	err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return true, nil }, stall)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("an identical status forever must stall, got %v", err)
 	}
@@ -163,7 +163,7 @@ func TestWaitStuckProgressTimesOut(t *testing.T) {
 	// Same progress value forever: growing messages would be an anti-pattern
 	// (a stuck load must stall out). No progress field at all here.
 	srv := stallServer(t, func() (float64, bool) { return 0, false })
-	alive := func() bool { return true }
+	alive := func() (bool, error) { return true, nil }
 
 	err := Wait(context.Background(), srv.URL+"/health", nil, alive, 120*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
@@ -177,7 +177,7 @@ func TestWaitRepeatedIdenticalProgressStalls(t *testing.T) {
 	const stall = 150 * time.Millisecond
 	srv := stallServer(t, func() (float64, bool) { return 0.5, true }) // stuck at 0.5
 	start := time.Now()
-	err := Wait(context.Background(), srv.URL, nil, func() bool { return true }, stall)
+	err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return true, nil }, stall)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("an unchanging numeric progress must stall, got %v", err)
 	}
@@ -193,7 +193,7 @@ func TestWaitMessageOnlyChangeDoesNotExtend(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	alive := func() bool { return true }
+	alive := func() (bool, error) { return true, nil }
 	err := Wait(context.Background(), srv.URL, nil, alive, 120*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("message-only changes must not extend: %v", err)
@@ -215,7 +215,7 @@ func TestWaitProgressProbeResetsDeadline(t *testing.T) {
 		return float64(changes) / 10, true
 	})
 
-	alive := func() bool { return true }
+	alive := func() (bool, error) { return true, nil }
 	start := time.Now()
 	err := Wait(context.Background(), health.URL, mustProbe(t, progress.URL+"#$.progress"), alive, 150*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
@@ -272,7 +272,7 @@ func TestWaitProgressProbeIsLoadBearing(t *testing.T) {
 		l := newLoad()
 		start := time.Now()
 		if err := Wait(context.Background(), l.health.URL, mustProbe(t, l.progress.URL+"#$.progress"),
-			func() bool { return true }, stall); err != nil {
+			func() (bool, error) { return true, nil }, stall); err != nil {
 			t.Fatalf("the PROGRESS probe must carry the wait to health: %v", err)
 		}
 		if elapsed := time.Since(start); elapsed < 2*stall {
@@ -288,7 +288,7 @@ func TestWaitProgressProbeIsLoadBearing(t *testing.T) {
 
 	t.Run("without probe stalls", func(t *testing.T) {
 		l := newLoad()
-		err := Wait(context.Background(), l.health.URL, nil, func() bool { return true }, stall)
+		err := Wait(context.Background(), l.health.URL, nil, func() (bool, error) { return true, nil }, stall)
 		if !errors.Is(err, ErrStalled) {
 			t.Fatalf("negative control: without the PROGRESS probe the wait must stall, got %v", err)
 		}
@@ -324,7 +324,7 @@ func TestWaitToleratesOneTransientDeadVerdict(t *testing.T) {
 	const stall = 150 * time.Millisecond
 	srv, _ := rampServer(t, 8)
 	var verdicts atomic.Int64
-	alive := func() bool { return verdicts.Add(1) != 3 } // exactly one blip
+	alive := func() (bool, error) { return verdicts.Add(1) != 3, nil } // exactly one blip
 
 	if err := Wait(context.Background(), srv.URL, nil, alive, stall); err != nil {
 		t.Fatalf("a single transient dead verdict must not break the wait: %v", err)
@@ -345,7 +345,7 @@ func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
 	const stall = 2 * time.Second
 	srv, _ := rampServer(t, 1000) // never reaches health within the test
 	var verdicts atomic.Int64
-	alive := func() bool { return verdicts.Add(1) < 3 } // dead from the 3rd on
+	alive := func() (bool, error) { return verdicts.Add(1) < 3, nil } // dead from the 3rd on
 
 	err := Wait(context.Background(), srv.URL, nil, alive, stall)
 	if !errors.Is(err, ErrBroken) {
@@ -361,7 +361,7 @@ func TestWaitDeadEngineIsBroken(t *testing.T) {
 	DeadWindow = 100 * time.Millisecond
 	t.Cleanup(func() { DeadWindow = restore })
 
-	alive := func() bool { return false }
+	alive := func() (bool, error) { return false, nil }
 	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, alive, time.Second)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("want ErrBroken, got %v", err)
@@ -379,7 +379,7 @@ func TestWaitDeadEngineAfterProgressIsBroken(t *testing.T) {
 		changes++
 		return float64(changes) / 10, true
 	})
-	alive := func() bool { return changes < 4 }
+	alive := func() (bool, error) { return changes < 4, nil }
 	err := Wait(context.Background(), srv.URL, nil, alive, 150*time.Millisecond)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("want ErrBroken, got %v", err)
@@ -394,7 +394,7 @@ func TestWaitProbeFailureNeverSucceeds(t *testing.T) {
 	// A dead PROGRESS endpoint: the probe errors on every call.
 	start := time.Now()
 	err := Wait(context.Background(), health.URL, mustProbe(t, "http://127.0.0.1:1/progress#$.progress"),
-		func() bool { return true }, stall)
+		func() (bool, error) { return true, nil }, stall)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("a failing progress probe must not extend the wait, got %v", err)
 	}
@@ -409,7 +409,7 @@ func TestWaitProbeFailureNeverSucceeds(t *testing.T) {
 // engine that never bound its port and one whose endpoint is wedged, so it
 // has to survive into the message.
 func TestWaitStalledNamesTheLastFetchFailure(t *testing.T) {
-	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() bool { return true }, 120*time.Millisecond)
+	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() (bool, error) { return true, nil }, 120*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("want ErrStalled, got %v", err)
 	}
@@ -425,7 +425,7 @@ func TestWaitBrokenNamesTheLastFetchFailure(t *testing.T) {
 	DeadWindow = 50 * time.Millisecond
 	t.Cleanup(func() { DeadWindow = restore })
 
-	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() bool { return false }, time.Second)
+	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() (bool, error) { return false, nil }, time.Second)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("want ErrBroken, got %v", err)
 	}
@@ -455,7 +455,7 @@ func TestWaitDeadVerdictsMustSpanTheDeadWindow(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	start := time.Now()
-	err := Wait(context.Background(), srv.URL, nil, func() bool { return false }, 200*time.Millisecond)
+	err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { return false, nil }, 200*time.Millisecond)
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("a sustained dead verdict must still be ErrBroken, got %v", err)
 	}
@@ -474,7 +474,7 @@ func TestWaitShortDeadRunStallsInsteadOfBreaking(t *testing.T) {
 
 	srv := stallServer(t, func() (float64, bool) { return 0, false }) // never healthy, never progressing
 	var verdicts atomic.Int64
-	err := Wait(context.Background(), srv.URL, nil, func() bool { verdicts.Add(1); return false }, 300*time.Millisecond)
+	err := Wait(context.Background(), srv.URL, nil, func() (bool, error) { verdicts.Add(1); return false, nil }, 300*time.Millisecond)
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("a dead run shorter than the window must stall, not break: %v", err)
 	}

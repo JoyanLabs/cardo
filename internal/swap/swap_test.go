@@ -1663,3 +1663,136 @@ func waitForFilePID(t *testing.T, path string, timeout time.Duration) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestRollbackSaveFailureStopsTheRestoredEngine pins the B#2 orphan guard: a
+// record save that fails AFTER the previous engine came back must stop that
+// engine (or fail loudly), never leave a live GPU holder that no record names.
+// regression: the round-4 fix was dead code via variable shadowing.
+func TestRollbackSaveFailureStopsTheRestoredEngine(t *testing.T) {
+	prev := conf(t, "prev")
+	prev.Drain = 0
+	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer hts.Close()
+	prev.Health = hts.URL
+	target := conf(t, "target")
+	target.Health = "http://127.0.0.1:1/health" // target fails health
+	target.Wait = 1
+	h := newHarness(t, prev, target)
+	if err := h.store.Save(state.Record{Version: 1, Active: "prev", ActivePID: h.engines["prev"].pid}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fail the first save (after stop), accept the second (after start) and
+	// break the final one (after the rollback restore): three saves per Up.
+	saves := 0
+	failing := &failureStore{inner: h.sw.State, failOn: 3, calls: &saves}
+	h.sw.State = failing
+
+	err := h.sw.Up(context.Background(), "target")
+	if !errors.Is(err, ErrSwapFailed) {
+		t.Fatalf("want ErrSwapFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "could not be saved after rollback") {
+		t.Errorf("the error must name the save failure: %v", err)
+	}
+	stops := 0
+	for _, a := range h.engines["prev"].actions {
+		if strings.HasPrefix(a, "stop prev") {
+			stops++
+		}
+	}
+	if stops < 2 {
+		t.Errorf("the restored engine must be stopped after the save failure; prev actions = %v", h.engines["prev"].actions)
+	}
+}
+
+type failureStore struct {
+	inner  Store
+	failOn int
+	calls  *int
+}
+
+func (f *failureStore) Load() (*state.Record, error) { return f.inner.Load() }
+
+func (f *failureStore) Save(r state.Record) error {
+	(*f.calls)++
+	if *f.calls == f.failOn {
+		return fmt.Errorf("disk on fire")
+	}
+	return f.inner.Save(r)
+}
+
+func (f *failureStore) Clear() error { return f.inner.Clear() }
+
+func (f *failureStore) DirPath() string { return f.inner.DirPath() }
+
+// TestUpRefusesCrossSlotAfterLegitimateHistory pins the A#1 slot drift: slot
+// must be refreshed by the successful up, so after up(0)→down→up(1) the record
+// says slot 1 and a same-slot swap on slot 1 is legal.
+func TestUpRefusesCrossSlotAfterLegitimateHistory(t *testing.T) {
+	a := conf(t, "a")
+	a.Slot = 0
+	b := conf(t, "b")
+	b.Slot = 1
+	c := conf(t, "c")
+	c.Slot = 1
+	h := newHarness(t, a, b, c)
+	// Lazy gated health: the port refuses (free) until each engine is up.
+	for _, name := range []string{"a", "b", "c"} {
+		h.engines[name].spec.Health = h.targetHealth(name)
+	}
+
+	if err := h.sw.Up(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.sw.Down(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.sw.Up(context.Background(), "b"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := h.store.Load()
+	if st.Slot != 1 {
+		t.Fatalf("record slot = %d, want 1 (the resident's real slot)", st.Slot)
+	}
+	// Same-slot swap must be legal.
+	if err := h.sw.Up(context.Background(), "c"); err != nil {
+		t.Fatalf("a same-slot swap must not be refused: %v", err)
+	}
+}
+
+// TestHealthWaitAbortsOnLivenessError pins A#2: a liveness check the driver
+// cannot answer is an abort, never a death certificate.
+func TestHealthWaitAbortsOnLivenessError(t *testing.T) {
+	// The target turns healthy late, but liveness fails from the start: the
+	// wait must abort with the liveness error instead of declaring Exit.
+	healthy := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case <-healthy:
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+	oldWindow := health.DeadWindow
+	health.DeadWindow = 100 * time.Millisecond
+	t.Cleanup(func() { health.DeadWindow = oldWindow })
+
+	closed := false
+	alive := func() (bool, error) {
+		if closed {
+			return false, fmt.Errorf("docker inspect: context deadline exceeded")
+		}
+		// First call ok, then the daemon wedges.
+		closed = true
+		return true, nil
+	}
+	err := health.Wait(context.Background(), srv.URL, nil, alive, 200*time.Millisecond)
+	if !errors.Is(err, health.ErrLivenessUnknownWrap) {
+		t.Fatalf("want liveness-unknown abort, got %v", err)
+	}
+}

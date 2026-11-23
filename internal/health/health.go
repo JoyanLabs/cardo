@@ -30,6 +30,12 @@ var ErrStalled = errors.New("health stalled: no progress within the WAIT window"
 // exited, or the wait was cancelled.
 var ErrBroken = errors.New("engine broken")
 
+// ErrLivenessUnknownWrap wraps a liveness-check failure so callers can
+// distinguish "the driver cannot answer" from "the engine died" with
+// errors.Is. Keep it exported so the swap layer can detect it without an
+// import cycle of error types.
+var ErrLivenessUnknownWrap = errors.New("liveness unknown")
+
 // deadVerdicts is how many consecutive !alive() answers it takes to call an
 // engine broken. One flaky verdict (a container inspect that answers once
 // while docker is busy) must not condemn an engine that is still loading;
@@ -70,7 +76,7 @@ func pollInterval(stall time.Duration) time.Duration {
 // deadVerdicts times in a row, over at least DeadWindow of wall time, is
 // ErrBroken (a short run of flaky verdicts is not). The last transport
 // failure is carried into both ErrStalled and ErrBroken.
-func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() bool, stall time.Duration) error {
+func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() (bool, error), stall time.Duration) error {
 	deadline := time.Now().Add(stall)
 	cadence := pollInterval(stall)
 	portSeen := false
@@ -86,7 +92,15 @@ func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive fu
 	client := &http.Client{Timeout: 5 * time.Second}
 
 	for {
-		if !alive() {
+		running, lerr := alive()
+		if lerr != nil {
+			// A liveness check the driver could not produce is never a death
+			// certificate: wrap it as broken-named-error without killing the
+			// engine numbering. The swap layer turns this into an abort by
+			// matching ErrLivenessUnknown via errors.Is.
+			return fmt.Errorf("%w: liveness check failed: %v%s", ErrLivenessUnknownWrap, lerr, fetchErrSuffix(lastFetchErr))
+		}
+		if !running {
 			if dead == 0 {
 				firstDead = time.Now()
 			}
