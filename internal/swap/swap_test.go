@@ -20,6 +20,7 @@ import (
 
 	"github.com/JoyanLabs/cardo/internal/config"
 	"github.com/JoyanLabs/cardo/internal/engine"
+	"github.com/JoyanLabs/cardo/internal/health"
 	"github.com/JoyanLabs/cardo/internal/state"
 )
 
@@ -53,8 +54,8 @@ func (f *fakeEngine) Start(ctx context.Context) (engine.Running, error) {
 	}
 	return engine.Running{PID: f.pid, Container: f.spec.Name}, nil
 }
-func (f *fakeEngine) Alive(_ context.Context, running engine.Running) bool {
-	return f.alive.Load() && running.PID == f.pid
+func (f *fakeEngine) Alive(_ context.Context, running engine.Running) (bool, error) {
+	return f.alive.Load() && running.PID == f.pid, nil
 }
 func (f *fakeEngine) Stop(_ context.Context, running engine.Running, _ time.Duration) error {
 	f.actions = append(f.actions, fmt.Sprintf("stop %s pid=%d", f.spec.Name, running.PID))
@@ -105,11 +106,16 @@ func newHarness(t *testing.T, specs ...*config.Engine) *harness {
 		h.engines[s.Name] = fe
 		reg.Engines[s.Name] = s
 	}
+	// swap-level tests only pin orchestration, not the 5s broken window;
+	// shrink it so a stalled health does not stall the suite.
+	oldWindow := health.DeadWindow
+	health.DeadWindow = 150 * time.Millisecond
+	h.t.Cleanup(func() { health.DeadWindow = oldWindow })
 	h.sw = &Swapper{
 		Registry: reg,
 		State:    h.store,
 		Factory:  func(spec *config.Engine) (engine.Engine, error) { return h.engines[spec.Name], nil },
-		Alive:    func(_ context.Context, _ *config.Engine, _ engine.Running) bool { return true },
+		Alive:    func(_ context.Context, _ *config.Engine, _ engine.Running) (bool, error) { return true, nil },
 		Out:      &h.out,
 	}
 	return h
@@ -127,6 +133,7 @@ func (h *harness) busyServer(initial int64) (url string, counter *atomic.Int64) 
 
 func (h *harness) healthServer(status func() int) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(status())
 	}))
 	h.t.Cleanup(srv.Close)
@@ -149,22 +156,45 @@ func (h *harness) targetHealth(name string) string {
 type gatedListener struct {
 	net.Listener
 	open func() bool
+	quit chan struct{}
 }
 
 func (g *gatedListener) Accept() (net.Conn, error) {
 	for {
-		c, err := g.Listener.Accept()
-		if err != nil {
-			return nil, err
+		if g.open != nil && !g.open() {
+			// While the fake engine is down, close the listening socket: a
+			// probing occupancy check then sees a kernel-level refusal, the
+			// honest shape of a free port (an accept-then-close would be an
+			// EOF, which the occupancy guard correctly treats as occupied).
+			// When the gate opens, re-listen on the same port so the health
+			// wait finds a serving socket.
+			g.Listener.Close()
+			for g.open != nil && !g.open() {
+				select {
+				case <-g.quit:
+					return nil, net.ErrClosed
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			select {
+			case <-g.quit:
+				return nil, net.ErrClosed
+			default:
+			}
+			ln, err := net.Listen("tcp", g.Addr().String())
+			if err != nil {
+				// The test closed everything (cleanup): stop serving.
+				return nil, net.ErrClosed
+			}
+			g.Listener = ln
+			continue
 		}
-		if g.open == nil || g.open() {
-			return c, nil
-		}
-		c.Close() // nobody home: the client sees a transport failure
+		return g.Listener.Accept()
 	}
 }
 
-// gatedHealth serves 200 on a port that refuses connections until open says
+// gatedHealth serves 200 on a port that is truly CLOSED (connection
+// refused, what a free port looks like to the kernel) until open says
 // otherwise.
 func (h *harness) gatedHealth(open func() bool) string {
 	h.t.Helper()
@@ -173,11 +203,28 @@ func (h *harness) gatedHealth(open func() bool) string {
 		h.t.Fatal(err)
 	}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
 	}))
-	srv.Listener = &gatedListener{Listener: ln, open: open}
+	// The gated re-listen leaves the server holding connections the stock
+	// Close cannot see; a short idle window keeps Close from blocking.
+	srv.Config.IdleTimeout = 100 * time.Millisecond
+	// While gated, close the listening socket entirely: an accept-then-close
+	// race shows the client an EOF, which the occupancy guard correctly
+	gl := &gatedListener{
+		Listener: ln,
+		open:     open,
+		// Wake the Accept loop when the test closes everything, so goServe
+		// can return and Server.Close does not block.
+		quit: make(chan struct{}),
+	}
+	h.t.Cleanup(func() {
+		close(gl.quit)
+		srv.CloseClientConnections()
+		srv.Close()
+	})
+	srv.Listener = gl
 	srv.Start()
-	h.t.Cleanup(srv.Close)
 	return srv.URL
 }
 
@@ -272,13 +319,13 @@ func mustSelector(sel string) *config.Selector {
 // deadResident makes every engine of the given name read as not running,
 // which is what a stale record looks like to the swap layer.
 func (h *harness) deadResident(names ...string) {
-	h.sw.Alive = func(_ context.Context, spec *config.Engine, _ engine.Running) bool {
+	h.sw.Alive = func(_ context.Context, spec *config.Engine, _ engine.Running) (bool, error) {
 		for _, n := range names {
 			if spec.Name == n {
-				return false
+				return false, nil
 			}
 		}
-		return true
+		return true, nil
 	}
 }
 
@@ -924,6 +971,7 @@ func TestMissingBusyDegradesToGraceWait(t *testing.T) {
 func TestPreUpFailureRollsBack(t *testing.T) {
 	prev := conf(t, "prev")
 	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hts.Close()
@@ -980,6 +1028,7 @@ func TestRollbackRecordsRestoredPID(t *testing.T) {
 // h0health is a health endpoint that always answers 200.
 func h0health(t *testing.T) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
@@ -998,6 +1047,7 @@ func TestHealthFailureRollsBackToPrevious(t *testing.T) {
 
 	// prev comes back healthy on rollback.
 	hts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hts.Close()
@@ -1422,6 +1472,28 @@ func TestUpStopsTargetWhenTheRecordCannotBeSaved(t *testing.T) {
 	st, _ := h.store.Load()
 	if st.Active != "" || st.ActivePID != 0 {
 		t.Errorf("the record must not claim an engine cardo could not record: %+v", st)
+	}
+}
+
+func TestUpRefusesACrossSlotSwap(t *testing.T) {
+	cur := conf(t, "current")
+	cur.Slot = 0
+	target := conf(t, "target")
+	target.Slot = 1
+	h := newHarness(t, cur, target)
+	if err := h.store.Save(state.Record{Version: 1, Active: "current", Slot: 0}); err != nil {
+		t.Fatal(err)
+	}
+	err := h.sw.Up(context.Background(), "target")
+	if err == nil || !strings.Contains(err.Error(), "slot 1") {
+		t.Fatalf("want a cross-slot refusal, got %v", err)
+	}
+	if len(h.engines["current"].actions) != 0 {
+		t.Errorf("the resident must not be retired across slots: %v", h.engines["current"].actions)
+	}
+	st, _ := h.store.Load()
+	if st.Active != "current" {
+		t.Errorf("record must be untouched, got %+v", st)
 	}
 }
 

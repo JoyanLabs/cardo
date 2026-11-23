@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -67,7 +68,13 @@ const healthProbeTimeout = 3 * time.Second
 // client is the package HTTP client for cardo's own one-shot requests (the
 // divergence warning). It is shared so no swap ever leaks a connection pool,
 // and its timeout bounds a wedged endpoint.
-var client = &http.Client{Timeout: 5 * time.Second}
+var client = &http.Client{
+	Timeout: 5 * time.Second,
+	// One-shot requests only: keep-alive would hold a health server's conn
+	// open past the swap, which is exactly what a test cleanup cannot
+	// close. DisableKeepAlives makes every probe self-contained.
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
 
 // httpNewRequest builds a bounded GET for a cardo endpoint, rejecting a
 // malformed URL rather than dialing nothing.
@@ -99,7 +106,7 @@ type Swapper struct {
 
 	// Alive reports whether a running handle is still alive; nil asks the
 	// engine driver.
-	Alive func(ctx context.Context, spec *config.Engine, running engine.Running) bool
+	Alive func(ctx context.Context, spec *config.Engine, running engine.Running) (bool, error)
 }
 
 func (s *Swapper) printf(format string, args ...any) {
@@ -115,15 +122,29 @@ func (s *Swapper) driver(spec *config.Engine) (engine.Engine, error) {
 	return engine.New(spec, engine.Options{})
 }
 
-func (s *Swapper) alive(ctx context.Context, spec *config.Engine, running engine.Running) bool {
+// aliveClassified is the typed answer of a liveness question: true (running),
+// false (confidently not running), or an error (the driver cannot answer —
+// a wedged docker daemon must abort the swap, never read as a stopped
+// engine).
+type aliveAnswer struct {
+	running bool
+	err     error
+}
+
+func (s *Swapper) alive(ctx context.Context, spec *config.Engine, running engine.Running) aliveAnswer {
 	if s.Alive != nil {
-		return s.Alive(ctx, spec, running)
+		running, err := s.Alive(ctx, spec, running)
+		return aliveAnswer{running, err}
 	}
 	drv, err := s.driver(spec)
 	if err != nil {
-		return false
+		return aliveAnswer{false, err}
 	}
-	return drv.Alive(ctx, running)
+	return aliveAnswer2(drv.Alive(ctx, running))
+}
+
+func aliveAnswer2(b bool, err error) aliveAnswer {
+	return aliveAnswer{b, err}
 }
 
 // Up swaps the resident engine for the named one, with full rollback.
@@ -144,6 +165,13 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 		rec = &state.Record{Slot: target.Slot}
 	} else if err != nil {
 		return err
+	}
+
+	// One record, one slot (B#4): a resident on slot 0 must never be
+	// retired to make room for a target that declares slot 1 — that is a
+	// silent cross-slot swap. cardo v1 manages one slot per record.
+	if rec.Active != "" && rec.Slot != target.Slot {
+		return fmt.Errorf("up %s: resident %s holds slot %d but %s declares slot %d; cardo v1 swaps one slot per record: free slot %d first", name, rec.Active, rec.Slot, target.Name, target.Slot, rec.Slot)
 	}
 
 	// ADR-0004: `previous` is always the engine stopped by THIS swap; a
@@ -237,7 +265,7 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 
 	s.printf("waiting for health of %s (stall timeout %ds)", target.Name, target.Wait)
 	err = health.Wait(ctx, target.Health, progressProbe(target),
-		func() bool { return s.alive(ctx, target, running) },
+		func() bool { return s.alive(ctx, target, running).running },
 		time.Duration(target.Wait)*time.Second)
 	if err != nil {
 		return s.failUp(ctx, rec, previous, target, drv, running, fmt.Errorf("health: %w", err))
@@ -249,25 +277,64 @@ func (s *Swapper) Up(ctx context.Context, name string) error {
 
 // healthAlreadyUp reports whether the target's HEALTH endpoint already
 // answers 2xx before cardo starts anything.
-func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) bool {
+// occupancyAsk classifies one occupancy probe: an HTTP answer (any status)
+// means somebody holds the port; a transport refusal means nobody is home;
+// anything else (black-holing occupant, cancelled context) fails closed.
+type occupancyAsk int
+
+const (
+	occupiedNo occupancyAsk = iota // refused connection: the slot is free
+	occupiedYes                     // any HTTP answer holds the port
+	occupiedUnknown                 // timeout or other error: fail closed
+)
+
+func (s *Swapper) healthAlreadyUp(ctx context.Context, spec *config.Engine) (occupancyAsk, error) {
 	ctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
 	defer cancel()
 	req, err := httpNewRequest(ctx, spec.Health)
 	if err != nil {
-		return false
+		return occupiedUnknown, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		// Nothing is listening: the slot is free, which is exactly what it
-		// looks like before cardo starts the engine that will answer it.
-		return false
+		if ctx.Err() != nil {
+			// The caller (or the operator) gave up: never read that as "free".
+			return occupiedUnknown, fmt.Errorf("occupancy check of %s cancelled: %w", spec.Health, ctx.Err())
+		}
+		if isRefused(err) {
+			// Nothing is listening: the slot is free, which is exactly what it
+			// looks like before cardo starts the engine that will answer it.
+			return occupiedNo, nil
+		}
+		// A black-holing occupant (SYN dropped, no RST) answers nothing but
+		// holds the port just as hard as a 200; fail closed.
+		return occupiedUnknown, fmt.Errorf("occupancy check of %s failed: %w", spec.Health, err)
 	}
 	defer resp.Body.Close()
 	// Any answer at all means somebody holds the port. A 404 from an nginx or
 	// a 503 from a half-dead upstream blocks the slot just as hard as a 200,
 	// and starting a second engine underneath it is the double-booking this
 	// guard exists to prevent; the status only says how alive they are.
-	return true
+	return occupiedYes, nil
+}
+
+// isRefused reports whether the transport error means "nobody is listening"
+// (connection refused / no route / no such host) rather than "nobody answered
+// in time".
+func isRefused(err error) bool {
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		if oe.Op == "dial" {
+			if errors.Is(oe.Err, syscall.ECONNREFUSED) || errors.Is(oe.Err, os.ErrNotExist) {
+				return true
+			}
+			var se syscall.Errno
+			if errors.As(oe.Err, &se) {
+				return se == syscall.ECONNREFUSED || se == syscall.EHOSTUNREACH || se == syscall.ENETUNREACH
+			}
+		}
+	}
+	return false
 }
 
 // The remedy in a refusal depends on what the operator can actually do about
@@ -289,7 +356,11 @@ const (
 // refuseOccupied turns "the HEALTH endpoint already answers" into the typed
 // refusal that stops a swap before a second engine is put on the same slot.
 func (s *Swapper) refuseOccupied(ctx context.Context, spec *config.Engine, remedy string) error {
-	if !s.healthAlreadyUp(ctx, spec) {
+	ask, err := s.healthAlreadyUp(ctx, spec)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSlotOccupied, err)
+	}
+	if ask != occupiedYes {
 		return nil
 	}
 	return fmt.Errorf("%w: something already answers HEALTH of %s, so cardo will not start a second engine on that slot; %s", ErrSlotOccupied, spec.Name, remedy)
@@ -316,6 +387,7 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 	rec.Active = ""
 	rec.ActivePID = 0
 	rec.ActiveAt = time.Time{}
+	var rrunning engine.Running
 	if previous != "" {
 		s.printf("rolling back to %s", previous)
 		prevSpec, haveSpec := s.Registry.Get(previous)
@@ -325,14 +397,16 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 			// process cardo has just started. A record that says nothing is
 			// resident makes it unkillable by any later `cardo down`, so the
 			// ownership stays recorded and the failure is said out loud.
-			if rrunning.PID > 0 && haveSpec && s.alive(cleanup, prevSpec, rrunning) {
-				rec.Active = previous
-				rec.ActiveAt = time.Now()
-				rec.ActivePID = rrunning.PID
-				if serr := s.State.Save(*rec); serr != nil {
-					return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy (%v), and recording it also failed: %v", ErrSwapFailed, cause, previous, rrunning.PID, rerr, serr)
+			if rrunning.PID > 0 && haveSpec {
+				if ans := s.alive(cleanup, prevSpec, rrunning); ans.running {
+					rec.Active = previous
+					rec.ActiveAt = time.Now()
+					rec.ActivePID = rrunning.PID
+					if serr := s.State.Save(*rec); serr != nil {
+						return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy (%v), and recording it also failed: %v", ErrSwapFailed, cause, previous, rrunning.PID, rerr, serr)
+					}
+					return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy; it stays running and recorded, so check it and then `cardo down` (rollback health wait: %v)", ErrSwapFailed, cause, previous, rrunning.PID, rerr)
 				}
-				return fmt.Errorf("%w: %v; rollback to %s is running (pid %d) but NOT verified healthy; it stays running and recorded, so check it and then `cardo down` (rollback health wait: %v)", ErrSwapFailed, cause, previous, rrunning.PID, rerr)
 			}
 			// It died or never came up: nothing of it may be left behind, and
 			// the record must not name a process that is not there.
@@ -354,8 +428,21 @@ func (s *Swapper) rollback(ctx context.Context, rec *state.Record, previous stri
 		rec.ActiveAt = time.Now()
 		rec.ActivePID = rrunning.PID
 	}
-	if err := s.State.Save(*rec); err != nil {
-		return err
+	if serr := s.State.Save(*rec); serr != nil {
+		// B#2: the restored engine is running but the record says nothing is
+		// resident — the exact orphan the record exists to prevent. The safe
+		// default is to stop what we just restored and report the whole
+		// story; the next `up` starts clean.
+		if previous != "" && rrunning.PID > 0 {
+			if prevSpec, haveSpec := s.Registry.Get(previous); haveSpec {
+				if prevDrv, derr := s.driver(prevSpec); derr == nil {
+					if serr2 := prevDrv.Stop(cleanup, rrunning, 10*time.Second); serr2 != nil {
+						return fmt.Errorf("%w: %v; the restored %s (pid %d) could not be stopped after the record save failed (%v, then %v) and is running unrecorded", ErrSwapFailed, cause, previous, rrunning.PID, serr, serr2)
+					}
+				}
+			}
+		}
+		return fmt.Errorf("%w: %v; the record could not be saved after rollback (%v), so nothing is resident", ErrSwapFailed, cause, serr)
 	}
 	return nil
 }
@@ -403,7 +490,7 @@ func (s *Swapper) bringUp(ctx context.Context, name string) (engine.Running, err
 		return engine.Running{}, err
 	}
 	if err := health.Wait(ctx, spec.Health, progressProbe(spec),
-		func() bool { return s.alive(ctx, spec, running) },
+		func() bool { return s.alive(ctx, spec, running).running },
 		time.Duration(spec.Wait)*time.Second); err != nil {
 		return running, err
 	}
@@ -478,7 +565,9 @@ func (s *Swapper) retire(ctx context.Context, name string, pid int) error {
 	// a question to the process, and a process that is not running answers
 	// nothing: the BUSY probe would burn the whole DRAIN budget and abort the
 	// swap over an engine that is already gone.
-	if !s.alive(ctx, spec, running) {
+	if ans := s.alive(ctx, spec, running); ans.err != nil {
+		return fmt.Errorf("cannot verify liveness of %s: %w", name, ans.err)
+	} else if !ans.running {
 		s.printf("warning: %s is not running; skipping drain and stop", name)
 		// The record diverged from reality, and whatever holds the slot is not
 		// what cardo started. Do not stack another engine on it.

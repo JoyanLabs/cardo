@@ -338,9 +338,9 @@ func TestWaitToleratesOneTransientDeadVerdict(t *testing.T) {
 // a run of consecutive dead verdicts is still ErrBroken, and it must take the
 // whole run (one verdict alone must not condemn the engine).
 func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
-	restore := deadWindow
-	deadWindow = 300 * time.Millisecond
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = 300 * time.Millisecond
+	t.Cleanup(func() { DeadWindow = restore })
 
 	const stall = 2 * time.Second
 	srv, _ := rampServer(t, 1000) // never reaches health within the test
@@ -357,9 +357,9 @@ func TestWaitSustainedDeadVerdictsAreBroken(t *testing.T) {
 }
 
 func TestWaitDeadEngineIsBroken(t *testing.T) {
-	restore := deadWindow
-	deadWindow = 100 * time.Millisecond
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = 100 * time.Millisecond
+	t.Cleanup(func() { DeadWindow = restore })
 
 	alive := func() bool { return false }
 	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, alive, time.Second)
@@ -369,9 +369,9 @@ func TestWaitDeadEngineIsBroken(t *testing.T) {
 }
 
 func TestWaitDeadEngineAfterProgressIsBroken(t *testing.T) {
-	restore := deadWindow
-	deadWindow = 100 * time.Millisecond
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = 100 * time.Millisecond
+	t.Cleanup(func() { DeadWindow = restore })
 
 	// The engine made progress, then died: broken, not stalled.
 	changes := 0
@@ -421,9 +421,9 @@ func TestWaitStalledNamesTheLastFetchFailure(t *testing.T) {
 // TestWaitBrokenNamesTheLastFetchFailure: the same for ErrBroken, where the
 // operator's next question is whether the process died or the endpoint did.
 func TestWaitBrokenNamesTheLastFetchFailure(t *testing.T) {
-	restore := deadWindow
-	deadWindow = 50 * time.Millisecond
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = 50 * time.Millisecond
+	t.Cleanup(func() { DeadWindow = restore })
 
 	err := Wait(context.Background(), "http://127.0.0.1:1/health", nil, func() bool { return false }, time.Second)
 	if !errors.Is(err, ErrBroken) {
@@ -440,9 +440,9 @@ func TestWaitBrokenNamesTheLastFetchFailure(t *testing.T) {
 // engine that is still loading. The endpoint alternates status codes, which
 // counts as progress and keeps the stall timeout out of the decision.
 func TestWaitDeadVerdictsMustSpanTheDeadWindow(t *testing.T) {
-	restore := deadWindow
-	deadWindow = 1 * time.Second
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = 1 * time.Second
+	t.Cleanup(func() { DeadWindow = restore })
 
 	var n atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -459,8 +459,8 @@ func TestWaitDeadVerdictsMustSpanTheDeadWindow(t *testing.T) {
 	if !errors.Is(err, ErrBroken) {
 		t.Fatalf("a sustained dead verdict must still be ErrBroken, got %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < deadWindow {
-		t.Errorf("ErrBroken after %v, shorter than the %v dead window it must span", elapsed, deadWindow)
+	if elapsed := time.Since(start); elapsed < DeadWindow {
+		t.Errorf("ErrBroken after %v, shorter than the %v dead window it must span", elapsed, DeadWindow)
 	}
 }
 
@@ -468,9 +468,9 @@ func TestWaitDeadVerdictsMustSpanTheDeadWindow(t *testing.T) {
 // side: with a dead window nothing inside the test can span, a run of dead
 // verdicts is treated as a flaky inspector and the wait reports the stall.
 func TestWaitShortDeadRunStallsInsteadOfBreaking(t *testing.T) {
-	restore := deadWindow
-	deadWindow = time.Hour
-	t.Cleanup(func() { deadWindow = restore })
+	restore := DeadWindow
+	DeadWindow = time.Hour
+	t.Cleanup(func() { DeadWindow = restore })
 
 	srv := stallServer(t, func() (float64, bool) { return 0, false }) // never healthy, never progressing
 	var verdicts atomic.Int64
@@ -489,7 +489,7 @@ func TestDeadVerdictRulesAreTheDocumentedOnes(t *testing.T) {
 	if deadVerdicts < 3 {
 		t.Errorf("deadVerdicts = %d, want at least 3 (one flaky verdict must not condemn an engine)", deadVerdicts)
 	}
-	if deadWindow < 5*time.Second {
-		t.Errorf("deadWindow = %v, want at least 5s of dead verdicts before ErrBroken", deadWindow)
+	if DeadWindow < 5*time.Second {
+		t.Errorf("DeadWindow = %v, want at least 5s of dead verdicts before ErrBroken", DeadWindow)
 	}
 }

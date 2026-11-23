@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -328,35 +330,64 @@ func TestDownStopsADeadRecordedPIDWithoutComplaint(t *testing.T) {
 // to look like a cold port that the engine itself warms up.
 func gatedHealth(t *testing.T, running func() bool) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Lazy gated health: reserve a port but do NOT listen on it until the
+	// gate opens. Before that, the port is genuinely free (connection
+	// refused), which is what the occupancy guard must see for an engine
+	// cardo has not started yet; any accept-ordering trick on a live
+	// listener races the kernel backlog and produces resets instead of
+	// refusals.
+	res, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	srv.Listener = &gateListener{Listener: ln, open: running}
-	srv.Start()
-	t.Cleanup(srv.Close)
-	return srv.URL
-}
+	addr := res.Addr().String()
+	res.Close()
 
-type gateListener struct {
-	net.Listener
-	open func() bool
-}
-
-func (g *gateListener) Accept() (net.Conn, error) {
-	for {
-		c, err := g.Listener.Accept()
-		if err != nil {
-			return nil, err
+	done := make(chan struct{})
+	var live atomic.Bool
+	// Poll the running() predicate OFF the dial path: it walks /proc, and
+	// doing that per gate check under -race is pathological. A poller
+	// samples it every 20ms; capture the predicate before reassigning
+	// running, or the poller races the reassignment and samples itself.
+	pred := running
+	srvM := &sync.Mutex{}
+	var srv *http.Server
+	go func() {
+		for {
+			live.Store(pred())
+			select {
+			case <-done:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			if live.Load() {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					return
+				}
+				hs := &http.Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						w.Header().Set("Connection", "close")
+						w.WriteHeader(http.StatusOK)
+					}),
+				}
+				srvM.Lock()
+				srv = hs
+				srvM.Unlock()
+				hs.Serve(ln)
+				return
+			}
 		}
-		if g.open == nil || g.open() {
-			return c, nil
+	}()
+	t.Cleanup(func() {
+		close(done)
+		srvM.Lock()
+		if srv != nil {
+			srv.Close()
 		}
-		c.Close() // nobody home: the client sees a transport failure
-	}
+		srvM.Unlock()
+	})
+	return "http://" + addr
 }
 
 // processRunningWith reports whether some live process carries want in its
@@ -529,6 +560,7 @@ func TestDownForgetClearsACorruptRecord(t *testing.T) {
 // instead of double-booking the slot, and nothing is started or recorded.
 func TestUpRefusesWhenTheSlotAlreadyAnswers(t *testing.T) {
 	hot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer hot.Close()

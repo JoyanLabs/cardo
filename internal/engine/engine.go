@@ -32,6 +32,11 @@ var ErrGone = errors.New("engine is gone")
 // the caller must abort rather than warn and start a second engine on it.
 var ErrNotOurs = errors.New("recorded pid is alive but does not match this engine's START")
 
+// aliveTimeout bounds one liveness probe (A: hooks got real budgets; the
+// same discipline applies to liveness — a wedged docker daemon must not
+// stall retire or health.Wait without bound).
+const aliveTimeout = 5 * time.Second
+
 // Running is the handle a Start returns: whichever identifier applies.
 type Running struct {
 	PID       int
@@ -43,7 +48,10 @@ type Running struct {
 type Engine interface {
 	Spec() *config.Engine
 	Start(ctx context.Context) (Running, error)
-	Alive(ctx context.Context, running Running) bool
+	// Alive reports liveness; an error means the driver cannot answer
+	// (dockerd down, missing binary). Callers must never read an error as
+	// "not running": that reads a wedged daemon as a stopped engine.
+	Alive(ctx context.Context, running Running) (bool, error)
 	Stop(ctx context.Context, running Running, grace time.Duration) error
 }
 
@@ -104,11 +112,19 @@ func (d *dockerEngine) Start(ctx context.Context) (Running, error) {
 }
 
 // Alive asks docker whether the container is running; an exited container
-// is not alive, so health can classify it broken (ADR-0005).
-func (d *dockerEngine) Alive(ctx context.Context, running Running) bool {
+// is not alive, so health can classify it broken (ADR-0005). A driver that
+// cannot answer (dockerd down, missing binary, deadline) is an ERROR, never
+// a confident "false": a wedged daemon must abort the swap, not read as a
+// stopped engine.
+func (d *dockerEngine) Alive(ctx context.Context, running Running) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, aliveTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, d.dockerBin, "inspect", "-f", "{{.State.Running}}", d.spec.Container)
 	out, err := cmd.Output()
-	return err == nil && strings.TrimSpace(string(out)) == "true"
+	if err != nil {
+		return false, fmt.Errorf("docker inspect %s: %w", d.spec.Container, err)
+	}
+	return strings.TrimSpace(string(out)) == "true", nil
 }
 
 func (d *dockerEngine) Stop(ctx context.Context, running Running, grace time.Duration) error {
@@ -152,12 +168,18 @@ func (c *composeEngine) Start(ctx context.Context) (Running, error) {
 	return Running{Container: c.spec.ComposeProject}, nil
 }
 
-// Alive reports whether the project has any running container.
-func (c *composeEngine) Alive(ctx context.Context, running Running) bool {
+// Alive reports whether the project has any running container. Driver
+// errors are errors, never "not running".
+func (c *composeEngine) Alive(ctx context.Context, running Running) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, aliveTimeout)
+	defer cancel()
 	args := append([]string{"compose"}, c.projectArgs()...)
 	args = append(args, "ps", "-q")
 	out, err := exec.CommandContext(ctx, c.dockerBin, args...).Output()
-	return err == nil && len(strings.TrimSpace(string(out))) > 0
+	if err != nil {
+		return false, fmt.Errorf("docker compose ps %s: %w", c.spec.ComposeProject, err)
+	}
+	return len(strings.TrimSpace(string(out))) > 0, nil
 }
 
 func (c *composeEngine) Stop(ctx context.Context, running Running, grace time.Duration) error {
@@ -204,9 +226,9 @@ func (c *commandEngine) Start(ctx context.Context) (Running, error) {
 	return Running{PID: cmd.Process.Pid}, nil
 }
 
-func (c *commandEngine) Alive(ctx context.Context, running Running) bool {
+func (c *commandEngine) Alive(ctx context.Context, running Running) (bool, error) {
 	if running.PID <= 0 {
-		return false
+		return false, nil
 	}
 	c.mu.Lock()
 	mine := c.cmd != nil && c.cmd.Process.Pid == running.PID
@@ -215,12 +237,12 @@ func (c *commandEngine) Alive(ctx context.Context, running Running) bool {
 		// Our own child: the authoritative signal is the wait channel.
 		select {
 		case <-c.done:
-			return false
+			return false, nil
 		default:
-			return true
+			return true, nil
 		}
 	}
-	return processAlive(running.PID)
+	return processAlive(running.PID), nil
 }
 
 // Stop stops a running handle: either the child this engine object started,

@@ -42,7 +42,10 @@ const deadVerdicts = 3
 // "dead" answers inside a few hundred milliseconds, while an engine that
 // really exited stays dead for as long as anyone looks. A variable so tests
 // can shrink it.
-var deadWindow = 5 * time.Second
+// DeadWindow is package-level so the swap tests can shrink it: the
+// orchestration layer pins drain, rollback and refusal semantics, not the
+// liveness window itself.
+var DeadWindow = 5 * time.Second
 
 // maxPoll bounds the probe cadence; it is clamped against the stall window
 // so a short WAIT still polls fast enough to notice progress.
@@ -64,7 +67,7 @@ func pollInterval(stall time.Duration) time.Duration {
 // deadline on observable progress. progress is the optional PROGRESS probe
 // (ADR-0005, passed parsed so the selector cannot be mangled); alive reports
 // whether the engine process/container is still alive. alive answering dead
-// deadVerdicts times in a row, over at least deadWindow of wall time, is
+// deadVerdicts times in a row, over at least DeadWindow of wall time, is
 // ErrBroken (a short run of flaky verdicts is not). The last transport
 // failure is carried into both ErrStalled and ErrBroken.
 func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive func() bool, stall time.Duration) error {
@@ -88,7 +91,7 @@ func Wait(ctx context.Context, healthURL string, progress *probe.Probe, alive fu
 				firstDead = time.Now()
 			}
 			dead++
-			if dead >= deadVerdicts && time.Since(firstDead) >= deadWindow {
+			if dead >= deadVerdicts && time.Since(firstDead) >= DeadWindow {
 				return fmt.Errorf("%w: engine process or container exited while loading%s", ErrBroken, fetchErrSuffix(lastFetchErr))
 			}
 		} else {

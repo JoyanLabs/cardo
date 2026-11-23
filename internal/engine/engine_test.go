@@ -242,15 +242,16 @@ func TestComposeUsesProjectDirectoryForADir(t *testing.T) {
 // able to classify a dead engine as broken rather than stalling forever.
 func TestDockerAlive(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		out  string
-		fail bool
-		want bool
+		name    string
+		out     string
+		fail    bool
+		want    bool
+		wantErr bool
 	}{
-		{"running", "true", false, true},
-		{"exited", "false", false, false},
-		{"padded", "true\n", false, true},
-		{"inspect fails", "true", true, false},
+		{"running", "true", false, true, false},
+		{"exited", "false", false, false, false},
+		{"padded", "true\n", false, true, false},
+		{"inspect fails", "true", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin, _ := shimDockerReply(t, tc.out, tc.fail)
@@ -259,7 +260,14 @@ func TestDockerAlive(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := eng.Alive(context.Background(), Running{Container: "c1"}); got != tc.want {
+			got, aerr := eng.Alive(context.Background(), Running{Container: "c1"})
+			if tc.wantErr {
+				if aerr == nil {
+					t.Errorf("Alive = %v, want a driver error (a wedged daemon is never 'not running')", got)
+				}
+				return
+			}
+			if aerr != nil || got != tc.want {
 				t.Errorf("Alive = %v, want %v (inspect said %q)", got, tc.want, tc.out)
 			}
 		})
@@ -269,7 +277,7 @@ func TestDockerAlive(t *testing.T) {
 	bin, log := shimDockerReply(t, "true", false)
 	e := dockerSpec(t, config.TypeDocker, "CONTAINER", "c1")
 	eng, _ := New(e, Options{DockerBin: bin})
-	if !eng.Alive(context.Background(), Running{Container: "c1"}) {
+	if b, aerr := eng.Alive(context.Background(), Running{Container: "c1"}); aerr != nil || !b {
 		t.Fatal("want alive")
 	}
 	lines := readLines(t, log)
@@ -297,7 +305,7 @@ func TestComposeAlive(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := eng.Alive(context.Background(), Running{Container: "proj"}); got != tc.want {
+			if got, aerr := eng.Alive(context.Background(), Running{Container: "proj"}); aerr != nil || got != tc.want {
 				t.Errorf("Alive = %v, want %v (ps -q said %q)", got, tc.want, tc.out)
 			}
 			lines := readLines(t, log)
@@ -313,16 +321,16 @@ func TestComposeAlive(t *testing.T) {
 func TestCommandAlive(t *testing.T) {
 	ctx := context.Background()
 	eng := &commandEngine{spec: dockerSpec(t, config.TypeCommand, "START", "true")}
-	if eng.Alive(ctx, Running{}) {
+	if b, _ := eng.Alive(ctx, Running{}); b {
 		t.Error("pid 0 must not be alive")
 	}
-	if eng.Alive(ctx, Running{PID: 99999999}) {
+	if b, _ := eng.Alive(ctx, Running{PID: 99999999}); b {
 		t.Error("a pid that never existed must not be alive")
 	}
 
 	// A foreign live pid (cardo did not start it) is still alive.
 	foreign := startDecoy(t, "sleep", "30")
-	if !eng.Alive(ctx, Running{PID: foreign}) {
+	if b, aerr := eng.Alive(ctx, Running{PID: foreign}); aerr != nil || !b {
 		t.Errorf("live foreign pid %d reported dead", foreign)
 	}
 
@@ -336,13 +344,13 @@ func TestCommandAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !own.Alive(ctx, running) {
+	if b, _ := own.Alive(ctx, running); !b {
 		t.Errorf("own child pid %d reported dead while running", running.PID)
 	}
 	if err := own.Stop(ctx, running, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if own.Alive(ctx, running) {
+	if b, _ := own.Alive(ctx, running); b {
 		t.Error("stopped child must not report alive")
 	}
 }
@@ -693,7 +701,7 @@ func TestCommandStopUnreapedPIDIsNotAHang(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Stop hung on a pid whose parent never reaps it")
 	}
-	if eng.Alive(context.Background(), Running{PID: pid}) {
+	if b, _ := eng.Alive(context.Background(), Running{PID: pid}); b {
 		t.Errorf("pid %d is not a running process; Alive must be false", pid)
 	}
 }
@@ -757,7 +765,7 @@ func TestCommandLifecycle(t *testing.T) {
 	if err := eng.Stop(ctx, running, time.Second); err != nil {
 		t.Errorf("Stop after exit must be idempotent, got %v", err)
 	}
-	if eng.Alive(ctx, running) {
+	if b, _ := eng.Alive(ctx, running); b {
 		t.Error("stopped engine must not report alive")
 	}
 	_ = dir
