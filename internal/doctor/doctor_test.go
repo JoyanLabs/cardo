@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -80,9 +81,24 @@ func (h *harness) run(t *testing.T) *Report {
 // commandConf is a valid command engine with its endpoints supplied by the
 // test, so a case only varies what it cares about.
 func commandConf(name, health string, extra ...string) string {
-	return fmt.Sprintf("NAME=%s\nTYPE=command\nSTART=sleep 4242\nHEALTH=%s\nDRAIN=0\nWAIT=5\nSLOT=0\n%s\n",
-		name, health, strings.Join(extra, "\n"))
+	return commandConfStart(name, health, engineStart("4242"), extra...)
 }
+
+// commandConfStart is commandConf for the tests that also spawn the process:
+// the recorded pid counts as a live resident only if its command line proves
+// it runs this exact START (ADR-0004), so the declaration and the process the
+// test starts have to agree to the byte.
+func commandConfStart(name, health, start string, extra ...string) string {
+	return fmt.Sprintf("NAME=%s\nTYPE=command\nSTART=%s\nHEALTH=%s\nDRAIN=0\nWAIT=5\nSLOT=0\n%s\n",
+		name, start, health, strings.Join(extra, "\n"))
+}
+
+// engineStart is the START a command engine declares when the test also
+// spawns the process that runs it. Two simple commands, so the shell stays as
+// process group leader and its command line is exactly `sh -c <START>`, the
+// shape the ownership proof accepts; a single command may be exec'd in place
+// by the shell and then proves nothing.
+func engineStart(marker string) string { return "sleep " + marker + " & sleep " + marker }
 
 func dockerConf(name, health string, extra ...string) string {
 	return fmt.Sprintf("NAME=%s\nTYPE=docker\nCONTAINER=%s\nHEALTH=%s\nDRAIN=0\nWAIT=5\nSLOT=0\n%s\n",
@@ -118,6 +134,19 @@ func allText(rep *Report) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// findingText returns the one finding line a case is about, so a test can
+// argue about wording instead of about whether something matched at all.
+func findingText(t *testing.T, rep *Report, substr string) string {
+	t.Helper()
+	for _, f := range rep.Findings {
+		if strings.Contains(f.String(), substr) {
+			return f.String()
+		}
+	}
+	t.Fatalf("no finding contains %q:\n%s", substr, allText(rep))
+	return ""
 }
 
 // jsonServer answers path with a JSON body; other paths 404.
@@ -280,6 +309,136 @@ func TestDoctorWarnsOnAMisnamedEngineFile(t *testing.T) {
 	}
 }
 
+// TestDoctorTellsTheOperatorToInspectNotJustRename is the wording rule both
+// halves of the misnamed-engine story need. A rename is not always the right
+// move: an editor backup is ignored on purpose (ADR-0006), and a copy of a
+// file that is already loaded would collide with it. What doctor can always
+// say is "look at this file".
+func TestDoctorTellsTheOperatorToInspectNotJustRename(t *testing.T) {
+	h := newHarness(t)
+	h.conf("good.conf", commandConf("good", closedPort(t)))
+	h.file(h.confDir, "tensorfold", dockerConf("tensorfold", "http://127.0.0.1:8888/health"))
+	h.file(h.confDir, "good.conf.bak", commandConf("good", closedPort(t)))
+	h.file(h.confDir, "good.conf~", commandConf("good", closedPort(t)))
+	h.file(h.confDir, "start.sh", "#!/bin/sh\nNAME=worker\nSLOT=3\nexec ./serve\n")
+
+	rep := h.run(t)
+
+	lost := findingText(t, rep, "tensorfold: not a .conf file, skipped")
+	if !strings.Contains(lost, "inspect") {
+		t.Errorf("the remedy must start with looking at the file: %q", lost)
+	}
+	if !strings.Contains(lost, "only if it is an engine") {
+		t.Errorf("a rename may only be suggested conditionally: %q", lost)
+	}
+
+	backup := findingText(t, rep, "good.conf~")
+	if !strings.Contains(backup, "backup") {
+		t.Errorf("a ~ file must be named as the editor backup it is: %q", backup)
+	}
+	if strings.Contains(backup, "renam") {
+		t.Errorf("ADR-0006 ignores ~ backups, so renaming one is not the advice: %q", backup)
+	}
+
+	dup := findingText(t, rep, "good.conf.bak")
+	if !strings.Contains(dup, "inspect") {
+		t.Errorf("a colliding file must be inspected, not renamed: %q", dup)
+	}
+	if !strings.Contains(dup, `"good"`) {
+		t.Errorf("the finding must name the NAME it collides with: %q", dup)
+	}
+	if strings.Contains(dup, "to register it") {
+		t.Errorf("renaming it would not register anything: %q", dup)
+	}
+
+	if strings.Contains(allText(rep), "start.sh") {
+		t.Errorf("a script that sets NAME= and SLOT= is not engine content: %s", allText(rep))
+	}
+}
+
+// TestDoctorWarnsOnAnEngineSavedAsYaml is the silent-engine fix: the
+// documentation list used to swallow every .yaml, .json, .toml and .html in
+// the engines directory, so an engine saved with the wrong extension was
+// skipped and never mentioned.
+func TestDoctorWarnsOnAnEngineSavedAsYaml(t *testing.T) {
+	h := newHarness(t)
+	h.conf("good.conf", commandConf("good", closedPort(t)))
+	h.file(h.confDir, "engine.yaml", dockerConf("tensorfold", "http://127.0.0.1:8888/health"))
+	h.file(h.confDir, "compose.yaml", "services:\n  demo:\n    image: busybox\n")
+	h.file(h.confDir, "package.json", `{"name": "cardo", "version": "0.1.0"}`)
+
+	rep := h.run(t)
+	if !hasFinding(rep, LevelWarn, "engine.yaml: not a .conf file, skipped") {
+		t.Errorf("an engine saved as .yaml must be named, not swallowed by the doc list: %s", allText(rep))
+	}
+	for _, quiet := range []string{"compose.yaml", "package.json"} {
+		if strings.Contains(allText(rep), quiet) {
+			t.Errorf("%s holds no engine keys and must stay quiet: %s", quiet, allText(rep))
+		}
+	}
+}
+
+// TestDoctorReportsASpecialFileWithoutOpeningIt is the hang fix: the content
+// peek used to open every non-.conf entry, and opening a named pipe for
+// reading waits for a writer that never comes. The pipe has to be reported as
+// skipped and never opened, with the run finishing on its own.
+func TestDoctorReportsASpecialFileWithoutOpeningIt(t *testing.T) {
+	h := newHarness(t)
+	h.conf("good.conf", commandConf("good", closedPort(t)))
+	if err := syscall.Mkfifo(filepath.Join(h.confDir, "engine.pipe"), 0o644); err != nil {
+		t.Skipf("mkfifo unavailable here: %v", err)
+	}
+
+	type done struct {
+		rep *Report
+		err error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ch := make(chan done, 1)
+	go func() {
+		rep, err := h.runner().Run(ctx)
+		ch <- done{rep, err}
+	}()
+	select {
+	case got := <-ch:
+		if got.err != nil {
+			t.Fatalf("Run: %v", got.err)
+		}
+		line := findingText(t, got.rep, "engine.pipe: special file, not inspected")
+		if !strings.Contains(line, "named pipe") {
+			t.Errorf("the line must say what kind of file it found: %q", line)
+		}
+		if strings.Contains(allText(got.rep), "engine.pipe: health") {
+			t.Errorf("an unopened file is not an engine to check: %s", allText(got.rep))
+		}
+		if !hasFinding(got.rep, LevelWarn, "good: health not reachable") {
+			t.Errorf("the engines beside it must still be checked: %s", allText(got.rep))
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("doctor hung on a named pipe in the engines directory")
+	}
+}
+
+// TestDoctorReturnsTheContextErrorInsteadOfVerdicts is the interrupt rule: a
+// pass whose context is already done must not walk the engines with a dead
+// context and call every unreachable endpoint "broken".
+func TestDoctorReturnsTheContextErrorInsteadOfVerdicts(t *testing.T) {
+	h := newHarness(t)
+	h.conf("a.conf", commandConf("a", closedPort(t)))
+	h.conf("b.conf", commandConf("b", closedPort(t)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rep, err := h.runner().Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("an interrupted pass must return the context error, got %v", err)
+	}
+	if rep != nil && len(rep.Findings) != 0 {
+		t.Errorf("a cancelled pass must render nothing, got:\n%s", allText(rep))
+	}
+}
+
 // TestDoctorReportsEveryBrokenConfigFile is the config-level rule again:
 // doctor validates the whole directory, not up to the first syntax error.
 func TestDoctorReportsEveryBrokenConfigFile(t *testing.T) {
@@ -305,7 +464,8 @@ func TestDoctorReportsEveryBrokenConfigFile(t *testing.T) {
 func TestDoctorFlagsARecordedResidentThatIsNotRunning(t *testing.T) {
 	srv := jsonServer(t, map[string]string{"/health": `{"status":"ok"}`})
 	h := newHarness(t)
-	h.conf("demo.conf", commandConf("demo", srv.URL+"/health"))
+	start := engineStart("4451")
+	h.conf("demo.conf", commandConfStart("demo", srv.URL+"/health", start))
 	h.state(`{"version":1,"slot":0,"active":"demo","active_pid":99999999}`)
 
 	rep := h.run(t)
@@ -313,7 +473,7 @@ func TestDoctorFlagsARecordedResidentThatIsNotRunning(t *testing.T) {
 		t.Errorf("a dead resident must be reported: %s", allText(rep))
 	}
 
-	live := spawnEngine(t, "4451")
+	live := spawnEngine(t, start)
 	h.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, live))
 	liveRep := h.run(t)
 	if hasFinding(liveRep, LevelWarn, "recorded resident but not running") {
@@ -321,6 +481,68 @@ func TestDoctorFlagsARecordedResidentThatIsNotRunning(t *testing.T) {
 	}
 	if !hasFinding(liveRep, LevelOK, "resident pid") {
 		t.Errorf("the live resident must be shown as resident: %s", allText(liveRep))
+	}
+}
+
+// TestDoctorWarnsWhenTheResidentPidIsNotProvablyOurs is ADR-0004 in the
+// read-only verbs. `cardo down` already refuses to signal a recorded pid it
+// cannot prove is its own, so doctor must not print that same pid as a
+// resident that is alive: an unrelated live process holding the GPU reads as
+// "all is well" otherwise. The START here names the very command the foreign
+// process runs, and it still proves nothing — cardo starts `sh -c <START>`.
+func TestDoctorWarnsWhenTheResidentPidIsNotProvablyOurs(t *testing.T) {
+	srv := jsonServer(t, map[string]string{"/health": `{"status":"ok"}`})
+	h := newHarness(t)
+	h.conf("demo.conf", commandConfStart("demo", srv.URL+"/health", "sleep 402"))
+	pid := spawnForeign(t, "402")
+	h.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, pid))
+
+	rep := h.run(t)
+	if !hasFinding(rep, LevelWarn, "demo: cannot verify ownership") {
+		t.Errorf("an unprovable live pid must be its own finding: %s", allText(rep))
+	}
+	if strings.Contains(allText(rep), "recorded resident but not running") {
+		t.Errorf("the process is alive; this record is not stale: %s", allText(rep))
+	}
+	if hasFinding(rep, LevelOK, "resident pid") {
+		t.Errorf("a pid cardo cannot prove is not a resident it measured: %s", allText(rep))
+	}
+
+	// The matching case is unchanged: the process the engine really started
+	// keeps its plain resident line.
+	h2 := newHarness(t)
+	start := engineStart("403")
+	h2.conf("demo.conf", commandConfStart("demo", srv.URL+"/health", start))
+	live := spawnEngine(t, start)
+	h2.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, live))
+	rep2 := h2.run(t)
+	if !hasFinding(rep2, LevelOK, fmt.Sprintf("resident pid %d alive", live)) {
+		t.Errorf("a provably own pid stays a live resident: %s", allText(rep2))
+	}
+	if strings.Contains(allText(rep2), "cannot verify ownership") {
+		t.Errorf("the matching case must not be doubted: %s", allText(rep2))
+	}
+}
+
+// TestDoctorKeepsTheResidentVerdictWhenTheEngineHasOtherFindings is the
+// report rule: whether the GPU is held is the question a swap turns on, so an
+// unrelated warning about the same engine must not swallow the liveness line.
+func TestDoctorKeepsTheResidentVerdictWhenTheEngineHasOtherFindings(t *testing.T) {
+	h := newHarness(t)
+	start := engineStart("404")
+	h.conf("demo.conf", commandConfStart("demo", closedPort(t), start))
+	live := spawnEngine(t, start)
+	h.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"demo","active_pid":%d}`, live))
+
+	rep := h.run(t)
+	if !hasFinding(rep, LevelWarn, "demo: health not reachable") {
+		t.Fatalf("the broken endpoint is still a finding: %s", allText(rep))
+	}
+	if !hasFinding(rep, LevelOK, fmt.Sprintf("demo: resident pid %d alive", live)) {
+		t.Errorf("the liveness line must survive the engine's other findings:\n%s", allText(rep))
+	}
+	if n := countFindings(rep, LevelOK, "resident pid"); n != 1 {
+		t.Errorf("the resident verdict must be printed once, got %d:\n%s", n, allText(rep))
 	}
 }
 
@@ -450,11 +672,26 @@ func TestDoctorNeverHangsOnAWedgedEndpoint(t *testing.T) {
 }
 
 // spawnEngine starts a long-lived process shaped like a cardo command engine
-// (sh as process group leader running the configured START) and returns its
-// pid; the group is killed when the test ends.
-func spawnEngine(t *testing.T, marker string) int {
+// (`sh -c <start>` as process group leader) and returns its pid; the group is
+// killed when the test ends. The caller passes the very START its engine
+// declares, which is what makes the ownership proof accept the pid.
+func spawnEngine(t *testing.T, start string) int {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", "sleep "+marker+" & sleep "+marker)
+	return spawnProc(t, "sh", "-c", start)
+}
+
+// spawnForeign starts a live process that is not a cardo engine at all — a
+// bare `sleep <marker>` with no shell in front of it — and returns its pid.
+// No configured START can prove it, which is the case the read-only verbs
+// must refuse to call alive.
+func spawnForeign(t *testing.T, marker string) int {
+	t.Helper()
+	return spawnProc(t, "sleep", marker)
+}
+
+func spawnProc(t *testing.T, argv ...string) int {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -462,14 +699,15 @@ func spawnEngine(t *testing.T, marker string) int {
 	pid := cmd.Process.Pid
 	// Wait for the exec to land: a pid captured straight after Start can
 	// still show the parent's command line.
+	want := strings.Join(argv, " ")
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		if strings.Contains(string(b), "sleep "+marker) {
+		if strings.Contains(string(b), argv[len(argv)-1]) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("engine %d never exec'd (cmdline %q)", pid, b)
+			t.Fatalf("process %d never ran %q (cmdline %q)", pid, want, b)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

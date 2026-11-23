@@ -360,6 +360,17 @@ func looksLikeEngine(pid int, start string) bool {
 	return provesOwnership(strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00"), start)
 }
 
+// ProvesOwnership reports whether the live process pid's command line proves
+// it is the process cardo started for START. It is exactly the proof Stop
+// demands before it will signal a recorded pid, exported for the read-only
+// verbs (`watch`, `doctor`), which must not report a pid they cannot prove as
+// a resident they measured: "a live process" and "my engine's process" are
+// different claims, and the second one is the only one worth printing as
+// alive. A false from here is neither alive nor gone — it is unknown.
+func ProvesOwnership(pid int, start string) bool {
+	return looksLikeEngine(pid, start)
+}
+
 // provesOwnership is the whole ownership rule, as a pure function of argv and
 // START so every shape is testable (a shell that has exec'd its payload is
 // gone again before any test could look at it).

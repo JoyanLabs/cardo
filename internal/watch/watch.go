@@ -88,6 +88,10 @@ type Snapshot struct {
 	// Resident says a record names a configured engine as holding the slot.
 	// Without it, Active may still name what the record claims.
 	Resident bool
+	// StateOK reports whether the ownership record was read at all. A record
+	// cardo cannot read is not an idle slot: with it false the snapshot cannot
+	// say who is resident, and the headline has to say so instead of "none".
+	StateOK  bool
 	Rows     []Row
 	Warnings []string
 }
@@ -106,15 +110,36 @@ type Runner struct {
 	DockerBin string
 	// Busy asks one engine's BUSY probe; nil asks the probe itself.
 	Busy func(ctx context.Context, spec *config.Engine) probe.Result
+	// ProvesOwnership answers the ADR-0004 question for a TYPE=command engine:
+	// is this pid the process this engine's own START started? It is the same
+	// proof `cardo down` applies before it signals anybody, and the alive
+	// column may not claim more than that: the record is a hint, a pid is a
+	// reusable number, and "alive yes" is exactly what makes an operator start
+	// a second engine on a GPU somebody else is holding. nil means
+	// engine.ProvesOwnership. docker and compose never consult it — for those
+	// the driver is the authority.
+	ProvesOwnership func(pid int, start string) bool
 	// Now is the snapshot clock; nil is time.Now.
 	Now func() time.Time
+}
+
+// provesOwnership applies the ownership proof the only way the alive column
+// may apply it.
+func (r *Runner) provesOwnership(spec *config.Engine, pid int) bool {
+	if r.ProvesOwnership != nil {
+		return r.ProvesOwnership(pid, spec.Start)
+	}
+	return engine.ProvesOwnership(pid, spec.Start)
 }
 
 // Snapshot takes one reading. It reports rather than fails: a loop that
 // stopped on the first unreachable engine would leave the operator staring at
 // a frozen screen, which is worse than a stale one.
 func (r *Runner) Snapshot(ctx context.Context) *Snapshot {
-	s := &Snapshot{Time: r.now(), ActiveAlive: unmeasured, Slot: 0}
+	// StateOK starts true because "there is no record" is a readable answer:
+	// an idle slot is a fact, not a gap. load flips it only when the record is
+	// there and cardo cannot read it.
+	s := &Snapshot{Time: r.now(), ActiveAlive: unmeasured, Slot: 0, StateOK: true}
 	rec, _ := r.load(s)
 
 	if rec != nil && rec.Active != "" {
@@ -221,7 +246,14 @@ func Render(w io.Writer, s *Snapshot) error {
 
 // picture is the status line: the same facts `cardo status` reports, in one
 // line a scanning eye can diff between ticks.
+//
+// An unreadable record is its own answer here. "resident none" is what an idle
+// slot looks like, and an operator who acts on that starts a second engine on
+// a GPU that may be held; the line has to say the verdict is unknown.
 func picture(s *Snapshot) string {
+	if !s.StateOK {
+		return "resident ? (unreadable state)  alive " + s.ActiveAlive
+	}
 	resident := s.Active
 	if resident == "" {
 		resident = "none"
@@ -278,6 +310,17 @@ func (r *Runner) aliveOf(ctx context.Context, spec *config.Engine, pid int) (str
 	if !alive {
 		return aliveNo, ""
 	}
+	// The process exists, which for TYPE=command is not yet the same as "this
+	// engine is up". `cardo down` refuses to signal a recorded pid it cannot
+	// prove is its own (ADR-0004), so this column must not claim a verdict the
+	// command would not act on: an unrelated process is somebody else's
+	// resident, and reading it as "alive yes" is how an operator starts a
+	// second engine on a held GPU. It is "?" and not "no" — the process really
+	// is there, and saying otherwise would send the operator to start this
+	// engine while the slot is busy.
+	if spec.Type == "command" && !r.provesOwnership(spec, pid) {
+		return unknown, fmt.Sprintf("alive unknown (pid does not match START): pid %d is not provably the process this engine started", pid)
+	}
 	return aliveYes, ""
 }
 
@@ -326,6 +369,7 @@ func (r *Runner) load(s *Snapshot) (*state.Record, error) {
 		return nil, nil
 	}
 	if err != nil {
+		s.StateOK = false
 		s.Warnings = append(s.Warnings, fmt.Sprintf("state: %v", err))
 		return nil, err
 	}

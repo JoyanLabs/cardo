@@ -354,16 +354,17 @@ func (r *Registry) Names() []string {
 // LoadDir loads every engine .conf in dir, skipping dotfiles, editor
 // backups and non-.conf files (documentation may live alongside engines),
 // and fails on duplicate NAME across files. An empty directory is a valid,
-// empty registry. The classification is ScanDir's, so a caller that wants to
-// report what was skipped and a caller that only wants to act cannot disagree
-// about what an engines directory contains.
+// empty registry. The classification is ScanDir's and the yes/no answer is
+// DirScan.Err(), so a caller that wants to report what was skipped and a
+// caller that only wants to act cannot disagree about what an engines
+// directory contains, or about whether it can be trusted.
 func LoadDir(dir string) (*Registry, error) {
 	scan, err := ScanDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	if len(scan.Problems) > 0 {
-		return nil, scan.Problems[0]
+	if err := scan.Err(); err != nil {
+		return nil, err
 	}
 	return scan.Registry, nil
 }

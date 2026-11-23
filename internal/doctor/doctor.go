@@ -121,6 +121,25 @@ type Runner struct {
 	Factory func(spec *config.Engine) (engine.Engine, error)
 	// DockerBin overrides the docker binary the default driver uses.
 	DockerBin string
+	// ProvesOwnership answers the ADR-0004 question for a TYPE=command engine:
+	// is this pid the process this engine's own START started? It is the same
+	// proof `cardo down` applies before it signals anybody, and a read-only
+	// verb may not claim more than that: the state file is a hint and a pid is
+	// a reusable number, so somebody else's live process holding the GPU would
+	// otherwise be printed as a resident that is alive. nil means
+	// engine.ProvesOwnership. docker and compose never consult it — for those
+	// the driver is the authority.
+	ProvesOwnership func(pid int, start string) bool
+}
+
+// provesOwnership applies the ownership proof as doctor has to apply it: the
+// recorded pid may be called a live resident only when it runs this engine's
+// START.
+func (r *Runner) provesOwnership(e *config.Engine, pid int) bool {
+	if r.ProvesOwnership != nil {
+		return r.ProvesOwnership(pid, e.Start)
+	}
+	return engine.ProvesOwnership(pid, e.Start)
 }
 
 // Run makes one pass. It returns an error only when the pass itself was
@@ -141,17 +160,26 @@ func (r *Runner) Run(ctx context.Context) (*Report, error) {
 		rep.add(LevelErr, "config", p.Error())
 	}
 	for _, sk := range scan.Skipped {
-		if !sk.EngineLike {
+		f, ok := skippedFinding(sk)
+		if !ok {
 			continue
 		}
-		// The whole point of this line: an engine whose file lost its suffix
-		// is not registered, and nothing else in cardo ever mentions it.
-		rep.add(LevelWarn, sk.Name, "not a .conf file, skipped: it holds engine configuration, so rename it to "+sk.Name+".conf to register it")
+		// The whole point of this line: an engine whose file lost its suffix is
+		// not registered, and nothing else in cardo ever mentions it.
+		rep.add(f.Level, f.Subject, f.Message)
 	}
 
 	rec, stateErr := r.loadState(rep)
 	names := scan.Registry.Names()
 	for _, name := range names {
+		// Each engine owns a process that can hold the GPU and an endpoint on
+		// the network, so a pass that asks questions per engine has to notice
+		// the operator walking away (Ctrl-C on a slow endpoint). An interrupt
+		// is not a verdict of "these engines are broken": the pass is over, the
+		// error is the answer, and nothing half-collected gets rendered.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		e, ok := scan.Registry.Get(name)
 		if !ok {
 			continue
@@ -162,6 +190,47 @@ func (r *Runner) Run(ctx context.Context) (*Report, error) {
 
 	rep.Engines = len(scan.Registry.Engines)
 	return rep, nil
+}
+
+// skippedFinding turns one file LoadDir would not read into the line the
+// operator has to see, or into nothing when the file is simply not an engine.
+//
+// Every remedy starts with looking at the file. A bare "rename it to X.conf"
+// is wrong advice twice over: an editor backup is ignored by ADR-0006 on
+// purpose, and a copy of a file that is already registered declares a NAME
+// that would collide, so renaming it registers nothing. A rename is only ever
+// offered conditionally, for the one file that really is an engine waiting to
+// be registered.
+func skippedFinding(sk config.SkippedFile) (Finding, bool) {
+	switch {
+	case sk.Special:
+		// cardo never opened it, so nothing is claimed about its content. The
+		// line says what it is and why that is a problem in an engines
+		// directory: reading a named pipe waits for a writer that never comes.
+		// Its first half is config's own wording, so `list` and `doctor` cannot
+		// describe the same file in two different ways.
+		return Finding{Level: LevelWarn, Subject: sk.Name,
+			Message: fmt.Sprintf("%s, and cardo reads regular files only, so this one blocks every verb that lists the directory; remove it or replace it with the engine file you meant to put here",
+				config.SpecialFileDescription(sk.Mode))}, true
+	case !sk.EngineLike:
+		// Documentation, scratch files, a stray script: allowed beside engines
+		// and not worth a line.
+		return Finding{}, false
+	case sk.Backup:
+		// ADR-0006 ignores name~ deliberately, so the honest line is "this is
+		// the editor's copy of name" — not "rename it into the registry".
+		return Finding{Level: LevelWarn, Subject: sk.Name,
+			Message: fmt.Sprintf("editor backup of %s, skipped: it holds engine configuration, and cardo ignores ~ files on purpose, so check the live file in or delete this one",
+				strings.TrimSuffix(sk.Name, "~"))}, true
+	case sk.DeclaresName != "":
+		// A copy of an engine that is already loaded: renaming it collides
+		// rather than registers, so the finding names the collision.
+		return Finding{Level: LevelWarn, Subject: sk.Name,
+			Message: fmt.Sprintf("not a .conf file, skipped: it holds engine configuration that declares the NAME %q an engine cardo already registers, so inspect it as a copy before touching it", sk.DeclaresName)}, true
+	default:
+		return Finding{Level: LevelWarn, Subject: sk.Name,
+			Message: fmt.Sprintf("not a .conf file, skipped: it holds engine configuration, so inspect it; rename it to %s.conf only if it is an engine you want registered", sk.Name)}, true
+	}
 }
 
 // checkEngine asks one engine its questions and writes its lines. An engine
@@ -189,17 +258,28 @@ func (r *Runner) checkEngine(ctx context.Context, rep *Report, e *config.Engine,
 	} else if summary != "" {
 		shown = append(shown, summary)
 	}
+	// The resident verdict is held apart from the other summaries on purpose:
+	// whether the GPU is held is the question a swap turns on, so a path
+	// problem, an absent field or an unreachable endpoint must not swallow it.
+	// "No line for this engine" reads as "nothing is resident".
+	resident := ""
 	if rec != nil && rec.Active == e.Name {
 		summary, fs := r.checkResident(ctx, e, rec)
 		findings = append(findings, fs...)
 		if len(fs) == 0 && summary != "" {
-			shown = append(shown, summary)
+			resident = summary
 		}
 	}
 
 	if len(findings) > 0 {
+		if resident != "" {
+			rep.add(LevelOK, e.Name, resident)
+		}
 		rep.Findings = append(rep.Findings, findings...)
 		return
+	}
+	if resident != "" {
+		shown = append(shown, resident)
 	}
 	line := "nothing to check"
 	if len(shown) > 0 {
@@ -312,6 +392,16 @@ func (r *Runner) checkResident(ctx context.Context, e *config.Engine, rec *state
 	if !alive {
 		return "", []Finding{{Level: LevelWarn, Subject: e.Name,
 			Message: fmt.Sprintf("recorded resident but not running: the record claims pid %d; if the engine is really gone, `cardo down --forget` clears the record", rec.ActivePID)}}
+	}
+	// The pid exists, which for TYPE=command is not yet the same as "this
+	// engine is up". ADR-0004 makes `cardo down` refuse to signal a recorded
+	// pid it cannot prove is its own, so a check that only reads must not
+	// claim more: without the START proof this is an unknown, printed as its
+	// own warning rather than folded into "alive" or into "not running" (the
+	// process really is there, and it may be the one holding the GPU).
+	if e.Type == "command" && !r.provesOwnership(e, rec.ActivePID) {
+		return "", []Finding{{Level: LevelWarn, Subject: e.Name,
+			Message: fmt.Sprintf("cannot verify ownership: pid %d is alive but is not provably the process this engine's START started; if the record diverged, `cardo down --forget` clears it", rec.ActivePID)}}
 	}
 	return fmt.Sprintf("resident pid %d alive", rec.ActivePID), nil
 }

@@ -584,6 +584,42 @@ func TestStopRecordedPIDAcceptsAnyShPath(t *testing.T) {
 	}
 }
 
+// TestProvesOwnershipChecksTheLiveProcess is the exported half of the proof.
+// The table above pins the rule; `watch` and `doctor` ask it about a pid they
+// did not start, so the wrapper has to read the command line the kernel
+// reports and answer the same way Stop would.
+func TestProvesOwnershipChecksTheLiveProcess(t *testing.T) {
+	const start = "sleep 411 & sleep 411"
+	pid := startDecoy(t, "sh", "-c", start)
+	waitForExec(t, pid, start)
+	if !ProvesOwnership(pid, start) {
+		t.Errorf("the process this START started must prove itself (pid %d)", pid)
+	}
+	if ProvesOwnership(pid, "sleep 999 & sleep 999") {
+		t.Errorf("another engine's START must not claim this pid")
+	}
+	if ProvesOwnership(pid, "") {
+		t.Errorf("an engine with no START can prove nothing")
+	}
+
+	// A bare `sleep 412` is somebody else's process: cardo starts
+	// `sh -c <START>`, and a plain START never proves an exec'd image.
+	foreign := startDecoy(t, "sleep", "412")
+	waitForExec(t, foreign, "412")
+	if !pidAlive(foreign) {
+		t.Fatalf("decoy %d is not alive", foreign)
+	}
+	if ProvesOwnership(foreign, "sleep 412") {
+		t.Errorf("a bare sleep is not `sh -c sleep 412`, however the words match")
+	}
+
+	// A pid that is no process at all proves nothing either — which is the
+	// caller's "unknown", never an implied "alive".
+	if ProvesOwnership(99999999, start) {
+		t.Errorf("a pid that is not a process cannot be anybody's engine")
+	}
+}
+
 // TestProvesOwnership exercises the ownership proof itself, argv shape by
 // argv shape. The real-process tests above cannot reach every shape (a shell
 // that execs its payload is gone before the test can look), so the table is

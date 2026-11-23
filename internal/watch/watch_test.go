@@ -69,18 +69,31 @@ func (f *fixture) runner(st Store) *Runner {
 // appended verbatim, so a test that names its own SLOT does not collide with
 // the default one.
 func commandConf(name, health string, extra ...string) string {
-	return engineConf("command", name, health, extra...)
+	return commandConfStart(name, health, engineStart("4343"), extra...)
+}
+
+// commandConfStart is commandConf with the START the test really spawns. The
+// alive column only says yes to a pid whose command line proves it runs this
+// exact START (ADR-0004), so the declaration and the process must agree to
+// the byte.
+func commandConfStart(name, health, start string, extra ...string) string {
+	return engineConf("command", name, health, append([]string{"START=" + start}, extra...)...)
 }
 
 func dockerConf(name, health string, extra ...string) string {
 	return engineConf("docker", name, health, extra...)
 }
 
+// engineStart is the START a command engine declares when the test also
+// spawns the process that runs it: two simple commands, so the shell stays as
+// process group leader and its command line is exactly `sh -c <START>`. A
+// single command can be exec'd in place by the shell, and then it proves
+// nothing.
+func engineStart(marker string) string { return "sleep " + marker + " & sleep " + marker }
+
 func engineConf(kind, name, health string, extra ...string) string {
 	lines := []string{"NAME=" + name, "TYPE=" + kind, "HEALTH=" + health, "DRAIN=0", "WAIT=5"}
-	if kind == "command" {
-		lines = append(lines, "START=sleep 4343")
-	} else {
+	if kind != "command" {
 		lines = append(lines, "CONTAINER="+name+"-ctr")
 	}
 	if !anyHasPrefix(extra, "SLOT=") {
@@ -111,11 +124,12 @@ func rowOf(s *Snapshot, name string) (Row, bool) {
 // status picture (who is resident, its pid, the slot, the rollback target)
 // and per-engine rows, with the active engine marked.
 func TestSnapshotShowsTheStatusPicturePlusLiveData(t *testing.T) {
+	start := engineStart("4441")
 	f := newFixture(t, map[string]string{
-		"on.conf":  commandConf("on", "http://127.0.0.1:1/health"),
+		"on.conf":  commandConfStart("on", "http://127.0.0.1:1/health", start),
 		"off.conf": commandConf("off", "http://127.0.0.1:2/health", "SLOT=1"),
 	})
-	live := spawnEngine(t, "4441")
+	live := spawnEngine(t, start)
 	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d,"previous":"off"}`, live))
 
 	s := f.runner(st).Snapshot(context.Background())
@@ -147,6 +161,65 @@ func TestSnapshotShowsTheStatusPicturePlusLiveData(t *testing.T) {
 	}
 }
 
+// TestSnapshotReportsALivePidItCannotProveAsUnknown is ADR-0004 in the alive
+// column. `cardo down` will not signal a recorded pid it cannot prove is its
+// own, so watch must not print that pid as alive either: a foreign process
+// holding the GPU is the one thing an operator about to swap has to see. The
+// START here names the very command the foreign process runs (`sleep 402`),
+// and it still proves nothing — cardo starts `sh -c <START>`.
+func TestSnapshotReportsALivePidItCannotProveAsUnknown(t *testing.T) {
+	f := newFixture(t, map[string]string{"on.conf": commandConfStart("on", "http://127.0.0.1:1/health", "sleep 402")})
+	foreign := spawnForeign(t, "402")
+	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d}`, foreign))
+
+	s := f.runner(st).Snapshot(context.Background())
+	if s.ActiveAlive != "?" {
+		t.Errorf("ActiveAlive = %q, want ? for a live pid cardo cannot prove", s.ActiveAlive)
+	}
+	on, ok := rowOf(s, "on")
+	if !ok {
+		t.Fatalf("rows = %+v", s.Rows)
+	}
+	if on.Alive != "?" {
+		t.Errorf("row alive = %q, want ?", on.Alive)
+	}
+	if !strings.Contains(on.Note, "alive unknown (pid does not match START)") {
+		t.Errorf("the row must explain why an alive-looking pid is not alive: %+v", on)
+	}
+	if !strings.Contains(on.Note, fmt.Sprint(foreign)) {
+		t.Errorf("the note must name the pid it could not claim: %+v", on)
+	}
+	// The other two verdicts stay distinguishable: unknown is neither "no"
+	// (the process really is there) nor "yes".
+	var b bytes.Buffer
+	if err := Render(&b, s); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(b.String(), "alive no") {
+		t.Errorf("a live process must never be shown as dead:\n%s", b.String())
+	}
+
+	// The matching case is unchanged: the process this engine's START really
+	// started is still yes.
+	start := engineStart("403")
+	f2 := newFixture(t, map[string]string{"on.conf": commandConfStart("on", "http://127.0.0.1:1/health", start)})
+	live := spawnEngine(t, start)
+	st2 := f2.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d}`, live))
+	if s2 := f2.runner(st2).Snapshot(context.Background()); s2.ActiveAlive != "yes" {
+		t.Errorf("ActiveAlive = %q, want yes for the pid this START started", s2.ActiveAlive)
+	}
+
+	// docker is driver-confirmed and never asks the pid proof: a driver that
+	// says alive is alive even with no pid at all.
+	fd := newFixture(t, map[string]string{"dock.conf": dockerConf("dock", "http://127.0.0.1:2/health")})
+	std := fd.state(`{"version":1,"slot":0,"active":"dock","active_pid":0}`)
+	r := fd.runner(std)
+	r.Factory = func(_ *config.Engine) (engine.Engine, error) { return fakeDriver{alive: true}, nil }
+	if s3 := r.Snapshot(context.Background()); s3.ActiveAlive != "yes" {
+		t.Errorf("a container stays driver-confirmed: %q", s3.ActiveAlive)
+	}
+}
+
 // TestSnapshotOrdersRowsByName pins the stable ordering a refreshing display
 // needs: rows that jump between ticks are unreadable.
 func TestSnapshotOrdersRowsByName(t *testing.T) {
@@ -169,11 +242,12 @@ func TestSnapshotOrdersRowsByName(t *testing.T) {
 // resident, whose queue is the one a swap would have to drain; asking every
 // engine would put a network round trip per row in a 2-second loop.
 func TestSnapshotCountsBusyOnlyForTheResident(t *testing.T) {
+	start := engineStart("4442")
 	f := newFixture(t, map[string]string{
-		"on.conf":  commandConf("on", "http://127.0.0.1:1/health", "BUSY=http://127.0.0.1:9/metrics#$.count"),
+		"on.conf":  commandConfStart("on", "http://127.0.0.1:1/health", start, "BUSY=http://127.0.0.1:9/metrics#$.count"),
 		"off.conf": commandConf("off", "http://127.0.0.1:2/health", "BUSY=http://127.0.0.1:9/metrics#$.count"),
 	})
-	live := spawnEngine(t, "4442")
+	live := spawnEngine(t, start)
 	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d}`, live))
 
 	var asked []string
@@ -196,8 +270,9 @@ func TestSnapshotCountsBusyOnlyForTheResident(t *testing.T) {
 // display: an unanswerable BUSY probe is "?", never 0, because a 0 in a
 // monitoring loop reads as "safe to swap" when the truth is unknown.
 func TestSnapshotRendersUnknownBusyAsQuestion(t *testing.T) {
-	f := newFixture(t, map[string]string{"on.conf": commandConf("on", "http://127.0.0.1:1/health", "BUSY=http://127.0.0.1:9/metrics#$.count")})
-	live := spawnEngine(t, "4443")
+	start := engineStart("4443")
+	f := newFixture(t, map[string]string{"on.conf": commandConfStart("on", "http://127.0.0.1:1/health", start, "BUSY=http://127.0.0.1:9/metrics#$.count")})
+	live := spawnEngine(t, start)
 	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d}`, live))
 
 	r := f.runner(st)
@@ -219,12 +294,13 @@ func TestSnapshotRendersUnknownBusyAsQuestion(t *testing.T) {
 // that cannot answer is "?", never "no" (a wedged dockerd is not an engine
 // that exited).
 func TestSnapshotUsesTheDriverForContainersAndThePidForCommands(t *testing.T) {
+	cmdStart := engineStart("4444")
 	f := newFixture(t, map[string]string{
-		"cmd.conf":  commandConf("cmd", "http://127.0.0.1:1/health"),
+		"cmd.conf":  commandConfStart("cmd", "http://127.0.0.1:1/health", cmdStart),
 		"dock.conf": dockerConf("dock", "http://127.0.0.1:2/health"),
 		"dead.conf": commandConf("dead", "http://127.0.0.1:3/health"),
 	})
-	live := spawnEngine(t, "4444")
+	live := spawnEngine(t, cmdStart)
 	shim := filepath.Join(t.TempDir(), "docker-shim")
 	if err := os.WriteFile(shim, []byte("#!/bin/sh\necho \"dockerd is unreachable\" >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
@@ -303,16 +379,59 @@ func TestSnapshotWithoutARecord(t *testing.T) {
 }
 
 // TestSnapshotReportsAnUnreadableRecord: watch must keep refreshing and say
-// the record is unreadable, rather than showing an idle slot.
+// the record is unreadable, rather than showing an idle slot. "resident none"
+// is the dangerous rendering: it is what an empty slot looks like, and an
+// operator who acts on it starts a second engine on a held GPU.
 func TestSnapshotReportsAnUnreadableRecord(t *testing.T) {
-	f := newFixture(t, map[string]string{"on.conf": commandConf("on", "http://127.0.0.1:1/health")})
+	f := newFixture(t, map[string]string{"on.conf": commandConf("on", "http://127.0.0.1:1/health", "SLOT=2")})
 	st := f.state("{not json")
 	s := f.runner(st).Snapshot(context.Background())
+	if s.StateOK {
+		t.Errorf("a record cardo could not read must be reported as unreadable: %+v", s)
+	}
 	if !strings.Contains(strings.Join(s.Warnings, "\n"), "state") {
 		t.Errorf("an unreadable record must be a warning line: %v", s.Warnings)
 	}
 	if len(s.Rows) != 1 {
 		t.Errorf("the registry must still be shown: %+v", s.Rows)
+	}
+
+	var b bytes.Buffer
+	if err := Render(&b, s); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	if !strings.Contains(out, "resident ? (unreadable state)") {
+		t.Errorf("the headline must say the verdict is unknown, not measured: %q", out)
+	}
+	if strings.Contains(out, "resident none") {
+		t.Errorf("an unreadable record must never read as an idle slot: %q", out)
+	}
+	// Nothing the record would have to supply may be shown as fact: the
+	// header's slot is unknown, and no row carries the resident mark.
+	header, rest := out, ""
+	if i := strings.Index(out, "\n"); i >= 0 {
+		header, rest = out[:i], out[i:]
+	}
+	if !strings.Contains(header, "slot -") {
+		t.Errorf("the slot column must be unknown as well: %q", header)
+	}
+	if strings.Contains(rest, "*") {
+		t.Errorf("no row may be marked resident from a record cardo could not read: %q", rest)
+	}
+
+	// Control: a record that simply is not there is an idle slot, and the
+	// headline says "none" with the declared slots intact.
+	if s := f.runner(f.emptyState()).Snapshot(context.Background()); !s.StateOK {
+		t.Errorf("no record at all is a readable answer: %+v", s)
+	}
+	idle := newFixture(t, map[string]string{"on.conf": commandConf("on", "http://127.0.0.1:1/health", "SLOT=2")})
+	var idleOut bytes.Buffer
+	if err := Render(&idleOut, idle.runner(idle.emptyState()).Snapshot(context.Background())); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(idleOut.String(), "resident none") || !strings.Contains(idleOut.String(), "slot 2") {
+		t.Errorf("an idle slot must still say none and show the declared slots:\n%s", idleOut.String())
 	}
 }
 
@@ -355,11 +474,12 @@ func TestRenderIsStableWidthAndANSIFree(t *testing.T) {
 
 // TestRenderMarksTheResident checks the marker an operator scans for.
 func TestRenderMarksTheResident(t *testing.T) {
+	start := engineStart("4445")
 	f := newFixture(t, map[string]string{
-		"on.conf":  commandConf("on", "http://127.0.0.1:1/health"),
+		"on.conf":  commandConfStart("on", "http://127.0.0.1:1/health", start),
 		"off.conf": commandConf("off", "http://127.0.0.1:2/health"),
 	})
-	live := spawnEngine(t, "4445")
+	live := spawnEngine(t, start)
 	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d,"previous":"off"}`, live))
 	var b bytes.Buffer
 	if err := Render(&b, f.runner(st).Snapshot(context.Background())); err != nil {
@@ -392,8 +512,9 @@ func TestRunPrintsOneSnapshotPerTick(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newFixture(t, map[string]string{"on.conf": commandConf("on", srv.URL+"/health", "BUSY="+srv.URL+"/metrics#$.connections")})
-	live := spawnEngine(t, "4446")
+	start := engineStart("4446")
+	f := newFixture(t, map[string]string{"on.conf": commandConfStart("on", srv.URL+"/health", start, "BUSY="+srv.URL+"/metrics#$.connections")})
+	live := spawnEngine(t, start)
 	st := f.state(fmt.Sprintf(`{"version":1,"slot":0,"active":"on","active_pid":%d}`, live))
 
 	var b bytes.Buffer
@@ -481,11 +602,25 @@ func (f fakeDriver) Stop(context.Context, engine.Running, time.Duration) error {
 }
 
 // spawnEngine starts a long-lived process shaped like a cardo command engine
-// (sh as process group leader running the configured START) and returns its
-// pid; the group is killed when the test ends.
-func spawnEngine(t *testing.T, marker string) int {
+// (`sh -c <start>` as process group leader) and returns its pid; the group is
+// killed when the test ends. The caller passes the very START its engine
+// declares, which is what lets the ownership proof accept the pid.
+func spawnEngine(t *testing.T, start string) int {
 	t.Helper()
-	cmd := exec.Command("sh", "-c", "sleep "+marker+" & sleep "+marker)
+	return spawnProc(t, "sh", "-c", start)
+}
+
+// spawnForeign starts a live process that is not a cardo engine at all — a
+// bare `sleep <marker>` with no shell in front of it — and returns its pid.
+// No configured START can prove it belongs to an engine.
+func spawnForeign(t *testing.T, marker string) int {
+	t.Helper()
+	return spawnProc(t, "sleep", marker)
+}
+
+func spawnProc(t *testing.T, argv ...string) int {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -494,11 +629,11 @@ func spawnEngine(t *testing.T, marker string) int {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		if strings.Contains(string(b), "sleep "+marker) {
+		if strings.Contains(string(b), argv[len(argv)-1]) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("engine %d never exec'd (cmdline %q)", pid, b)
+			t.Fatalf("process %d never exec'd (cmdline %q)", pid, b)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

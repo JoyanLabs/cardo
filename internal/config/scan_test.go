@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // goodConf is a valid engine, used wherever a directory needs at least one
@@ -159,6 +161,275 @@ func TestLoadDirStillStopsAtTheFirstProblem(t *testing.T) {
 	}
 	if _, err := ScanDir(filepath.Join(t.TempDir(), "nope")); !os.IsNotExist(err) {
 		t.Errorf("ScanDir must pass the directory error through unchanged, got %v", err)
+	}
+}
+
+// scanIn runs a scan that must never block, and fails the test instead of
+// hanging the suite if it does. A named pipe in an engines directory is the
+// case this guards: opening one for reading waits for a writer, and nothing
+// in this file opens one.
+func scanIn(t *testing.T, dir string) *DirScan {
+	t.Helper()
+	type result struct {
+		scan *DirScan
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, err := ScanDir(dir)
+		done <- result{s, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("ScanDir: %v", res.err)
+		}
+		return res.scan
+	case <-time.After(5 * time.Second):
+		t.Fatal("ScanDir blocked on an engines directory it should only have listed")
+	}
+	return nil
+}
+
+// mkfifo makes a named pipe in dir, the file shape that used to be opened
+// just to guess what it was.
+func mkfifo(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := syscall.Mkfifo(p, 0o644); err != nil {
+		t.Skipf("mkfifo unavailable here: %v", err)
+	}
+	return p
+}
+
+// TestScanDirNeverOpensASpecialFile is the critical one: an operator (or a
+// buggy launcher) leaves a named pipe in the engines directory, and the
+// content peek opened it. Reading a FIFO blocks until somebody opens the
+// other end, so `cardo list`, `cardo up` and `cardo doctor` all hung with no
+// timeout and no message. A special file is now reported as skipped and is
+// never opened.
+func TestScanDirNeverOpensASpecialFile(t *testing.T) {
+	dir := dirWith(t, map[string]string{
+		"good.conf": goodConf,
+		"README.md": "# engines\n",
+	})
+	mkfifo(t, dir, "engine.pipe")
+
+	scan := scanIn(t, dir)
+
+	if _, ok := scan.Registry.Get("good"); !ok {
+		t.Errorf("a stray fifo must not cost the operator the engines that load: %v", scan.Registry.Names())
+	}
+	var pipe, doc *SkippedFile
+	for i := range scan.Skipped {
+		switch scan.Skipped[i].Name {
+		case "engine.pipe":
+			pipe = &scan.Skipped[i]
+		case "README.md":
+			doc = &scan.Skipped[i]
+		}
+	}
+	if pipe == nil {
+		t.Fatalf("the named pipe must be reported as skipped: %+v", scan.Skipped)
+	}
+	if !pipe.Special {
+		t.Errorf("a fifo must be classified as a special file, never opened: %+v", *pipe)
+	}
+	if pipe.EngineLike {
+		t.Errorf("a file cardo never opened cannot be claimed to hold engine content: %+v", *pipe)
+	}
+	if pipe.Mode&os.ModeNamedPipe == 0 {
+		t.Errorf("the report line needs the mode to say what it found: %+v", *pipe)
+	}
+	if doc == nil || doc.Special {
+		t.Errorf("an ordinary document is skipped but not special: %+v", scan.Skipped)
+	}
+
+	// LoadDir goes through the same scan, so every verb is covered by it.
+	done := make(chan error, 1)
+	go func() {
+		_, err := LoadDir(dir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("LoadDir must load the engines beside a fifo, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LoadDir blocked on a named pipe in the engines directory")
+	}
+}
+
+// TestScanDirRefusesToOpenASpecialFileNamedConf closes the other half of the
+// same hole: the entry that gets opened without any classification is the one
+// whose name ends in .conf, so a fifo named like an engine has to be refused
+// as a problem rather than read.
+func TestScanDirRefusesToOpenASpecialFileNamedConf(t *testing.T) {
+	dir := dirWith(t, map[string]string{"good.conf": goodConf})
+	mkfifo(t, dir, "broken.conf")
+
+	scan := scanIn(t, dir)
+	if len(scan.Problems) != 1 {
+		t.Fatalf("the fifo masquerading as an engine must be one problem, got %v", scan.Problems)
+	}
+	if !strings.Contains(scan.Problems[0].Error(), "broken.conf") ||
+		!strings.Contains(scan.Problems[0].Error(), "special file, not inspected") {
+		t.Errorf("the problem must name the file and say it was not opened: %v", scan.Problems[0])
+	}
+	if _, ok := scan.Registry.Get("good"); !ok {
+		t.Errorf("a broken neighbour must not hide the engine that loads: %v", scan.Registry.Names())
+	}
+	if _, err := LoadDir(dir); err == nil || !strings.Contains(err.Error(), "broken.conf") {
+		t.Errorf("LoadDir must still refuse a directory it cannot trust, got %v", err)
+	}
+}
+
+// TestEngineLikeNeedsEngineKeysNotJustAnyKeys is the false-positive half of
+// the misnamed-engine rule: a shell script beside the engines legitimately
+// sets NAME= and SLOT= for its own purposes. Claiming engine content on one
+// or two incidental keys is what makes doctor cry wolf, so it takes at least
+// two distinct known keys and one of the keys only an engine writes.
+func TestEngineLikeNeedsEngineKeysNotJustAnyKeys(t *testing.T) {
+	dir := dirWith(t, map[string]string{
+		"good.conf": goodConf,
+		// A launcher script: two known keys, neither of them an engine key.
+		"start.sh": "#!/bin/sh\nNAME=worker\nSLOT=3\nexec ./serve\n",
+		// One engine key alone is not enough either.
+		"single":    "HEALTH=http://127.0.0.1:9/health\n",
+		"onlytype":  "TYPE=command\n",
+		"onlystart": "START=./run\n",
+		// Two known keys, one of them an engine key: an engine that lost its
+		// suffix.
+		"tensorfold": "NAME=tensorfold\nSTART=./serve --port 8080\n",
+		// An engine key inside a comment is not a declaration.
+		"notes": "# HEALTH=http://127.0.0.1:9/health\nSLOT=0\nOWNER=me\n",
+	})
+	scan := scanIn(t, dir)
+
+	for name, want := range map[string]bool{
+		"start.sh":   false,
+		"single":     false,
+		"onlytype":   false,
+		"onlystart":  false,
+		"tensorfold": true,
+		"notes":      false,
+	} {
+		got, ok := skippedNamed(t, scan, name)
+		if !ok {
+			continue
+		}
+		if got.EngineLike != want {
+			t.Errorf("%s: EngineLike = %v, want %v", name, got.EngineLike, want)
+		}
+	}
+}
+
+// skippedNamed looks one skipped file up, failing the test when the scan did
+// not report it at all.
+func skippedNamed(t *testing.T, scan *DirScan, name string) (*SkippedFile, bool) {
+	t.Helper()
+	for i := range scan.Skipped {
+		if scan.Skipped[i].Name == name {
+			return &scan.Skipped[i], true
+		}
+	}
+	t.Errorf("%s must be reported as skipped: %+v", name, scan.Skipped)
+	return nil, false
+}
+
+// TestScanMarksEditorBackupsWithoutRenamingThem pins the shape doctor needs:
+// a `name~` backup is an editor's leftover that ADR-0006 ignores on purpose,
+// so it is classified as a backup whether or not its content looks like an
+// engine (it usually does — it is a copy of one).
+func TestScanMarksEditorBackupsWithoutRenamingThem(t *testing.T) {
+	dir := dirWith(t, map[string]string{
+		"good.conf":   goodConf,
+		"good.conf~":  misnamedEngine,
+		"scratch~":    "just a note\n",
+		"tabby.conf~": misnamedEngine,
+	})
+	scan := scanIn(t, dir)
+
+	for _, name := range []string{"good.conf~", "scratch~", "tabby.conf~"} {
+		sk, ok := skippedNamed(t, scan, name)
+		if !ok {
+			continue
+		}
+		if !sk.Backup {
+			t.Errorf("%s is an editor backup and must be named as one: %+v", name, *sk)
+		}
+	}
+	if sk, ok := skippedNamed(t, scan, "good.conf~"); ok && !sk.EngineLike {
+		t.Errorf("a backup of an engine still holds engine content: %+v", *sk)
+	}
+}
+
+// TestScanFlagsASkippedEngineThatDeclaresARegisteredName gives doctor the
+// fact it needs to stop telling the operator to rename a file that would only
+// collide with the engine already loaded.
+func TestScanFlagsASkippedEngineThatDeclaresARegisteredName(t *testing.T) {
+	dir := dirWith(t, map[string]string{
+		"good.conf":     goodConf, // NAME=good
+		"good.conf.bak": goodConf,
+		"tensorfold":    misnamedEngine,
+	})
+	scan := scanIn(t, dir)
+
+	if sk, ok := skippedNamed(t, scan, "good.conf.bak"); ok {
+		if !sk.EngineLike {
+			t.Errorf("a copy of a valid engine is engine content: %+v", *sk)
+		}
+		if sk.DeclaresName != "good" {
+			t.Errorf("the collision must be recorded so the remedy is not a rename: %+v", *sk)
+		}
+	}
+	if sk, ok := skippedNamed(t, scan, "tensorfold"); ok && sk.DeclaresName != "" {
+		t.Errorf("tensorfold declares a free NAME, so a rename really is its remedy: %+v", *sk)
+	}
+}
+
+// TestDocExtsLeaveConfigShapesToTheEngineCheck is the silent-engine fix:
+// .json/.yaml/.yml/.toml/.html/.adoc were on the documentation list, so an
+// engine saved as engine.yaml was skipped with nothing said about it. Those
+// extensions now fall through to the content check, while real documentation
+// stays quiet however many KEY=value lines a code sample quotes.
+func TestDocExtsLeaveConfigShapesToTheEngineCheck(t *testing.T) {
+	dir := dirWith(t, map[string]string{
+		"good.conf":   goodConf,
+		"engine.yaml": misnamedEngine,
+		"engine.yml":  misnamedEngine,
+		"engine.json": misnamedEngine,
+		"engine.toml": misnamedEngine,
+		"engine.html": misnamedEngine,
+		"engine.adoc": misnamedEngine,
+		// Real documentation, and foreign config shapes that hold no engine
+		// keys: neither must be reported as a lost engine.
+		"README.md":    "# engines\n\n```\nNAME=\"vllm\"\nTYPE=\"docker\"\n```\n",
+		"notes.txt":    "Remember NAME=good is the resident.\n",
+		"guide.rst":    "SLOT=0 is the first GPU.\n",
+		"package.json": `{"name": "cardo", "version": "0.1.0"}`,
+		"compose.yaml": "services:\n  demo:\n    image: busybox\n",
+	})
+	scan := scanIn(t, dir)
+
+	for _, name := range []string{"engine.yaml", "engine.yml", "engine.json", "engine.toml", "engine.html", "engine.adoc"} {
+		sk, ok := skippedNamed(t, scan, name)
+		if !ok {
+			continue
+		}
+		if !sk.EngineLike {
+			t.Errorf("%s holds engine keys and must be named, not silently swallowed by the doc list: %+v", name, *sk)
+		}
+	}
+	for _, name := range []string{"README.md", "notes.txt", "guide.rst", "package.json", "compose.yaml"} {
+		sk, ok := skippedNamed(t, scan, name)
+		if !ok {
+			continue
+		}
+		if sk.EngineLike {
+			t.Errorf("%s is not an engine and must stay quiet: %+v", name, *sk)
+		}
 	}
 }
 
