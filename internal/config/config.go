@@ -354,31 +354,18 @@ func (r *Registry) Names() []string {
 // LoadDir loads every engine .conf in dir, skipping dotfiles, editor
 // backups and non-.conf files (documentation may live alongside engines),
 // and fails on duplicate NAME across files. An empty directory is a valid,
-// empty registry.
+// empty registry. The classification is ScanDir's, so a caller that wants to
+// report what was skipped and a caller that only wants to act cannot disagree
+// about what an engines directory contains.
 func LoadDir(dir string) (*Registry, error) {
-	entries, err := os.ReadDir(dir)
+	scan, err := ScanDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	reg := &Registry{Engines: map[string]*Engine{}}
-	for _, ent := range entries {
-		name := ent.Name()
-		if ent.IsDir() || strings.HasPrefix(name, ".") || strings.HasSuffix(name, "~") || !strings.HasSuffix(name, ".conf") {
-			continue
-		}
-		e, err := ParseFile(filepath.Join(dir, name))
-		if err != nil {
-			return nil, err
-		}
-		if err := e.Validate(); err != nil {
-			return nil, err
-		}
-		if _, dup := reg.Engines[e.Name]; dup {
-			return nil, fmt.Errorf("%s: NAME %q already declared in another file", e.File, e.Name)
-		}
-		reg.Engines[e.Name] = e
+	if len(scan.Problems) > 0 {
+		return nil, scan.Problems[0]
 	}
-	return reg, nil
+	return scan.Registry, nil
 }
 
 // ErrNotFound is returned when no engine with the requested name exists.
